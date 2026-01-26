@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+.conda/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (large dataset - should be downloaded separately)
+EMG-EPN612 Dataset/
+
+# Model checkpoints and outputs
+*.h5
+*.pkl
+*.joblib
+checkpoints/
+models/
+outputs/
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+*.tmp
+*.temp
