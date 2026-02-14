@@ -49,6 +49,8 @@ EMG-EPN612 Dataset/
 *.h5
 *.pkl
 *.joblib
+*.parquet
+training_chunks/
 checkpoints/
 models/
 outputs/
