@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import SGDClassifier
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.utils import shuffle as sklearn_shuffle
+from sklearn.kernel_approximation import Nystroem
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -67,12 +67,12 @@ FEATURE_COLS = [f"{ch}_{feat}" for ch in CHANNELS for feat in TD9_NAMES]
 N_FEATURES = len(FEATURE_COLS)  # 72
 
 # --- Default hyper-parameters -------------------------------------------------
-DEFAULT_EPOCHS       = 5       # full passes over the dataset
-DEFAULT_CHUNK_SIZE   = 20      # number of patients per training chunk
-DEFAULT_BATCH_SIZE   = 512     # mini-batch size for partial_fit
+DEFAULT_EPOCHS       = 20      # max full passes (SGD iterations) over the dataset
 DEFAULT_ALPHA        = 1e-4    # regularization strength (lambda = 1/C)
 DEFAULT_LEARNING_RATE = "optimal"  # adaptive schedule: eta = 1 / (alpha * (t0 + t))
 DEFAULT_VAL_FRAC     = 0.15    # fraction of patients held out for validation
+DEFAULT_N_COMPONENTS = 500     # Nystroem: number of RBF kernel features
+DEFAULT_GAMMA        = None    # Nystroem: RBF bandwidth (None = 1/n_features)
 
 
 # --- Helpers ------------------------------------------------------------------
@@ -94,7 +94,7 @@ def split_patients(all_users: np.ndarray, val_frac: float, seed: int = 42):
     return train_users, val_users
 
 
-def evaluate(clf, scaler, X_val, y_val, label_encoder, batch_size=4096):
+def evaluate(clf, scaler, kernel_map, X_val, y_val, label_encoder, batch_size=4096):
     """Evaluate the classifier on a validation set (in batches to save RAM).
 
     Returns accuracy and the classification report string.
@@ -102,6 +102,8 @@ def evaluate(clf, scaler, X_val, y_val, label_encoder, batch_size=4096):
     y_pred_parts = []
     for start in range(0, len(X_val), batch_size):
         X_batch = scaler.transform(X_val[start : start + batch_size])
+        if kernel_map is not None:
+            X_batch = kernel_map.transform(X_batch)
         y_pred_parts.append(clf.predict(X_batch))
     y_pred = np.concatenate(y_pred_parts)
     acc = accuracy_score(y_val, y_pred)
@@ -230,30 +232,13 @@ def train(args):
     print(f"  Saved {scaled_path.name}  ({time.time()-t0:.1f}s)")
     print()
 
-    # -- 6. Build patient-to-row-index mapping ---------------------------------
-    #
-    # For each patient, store the row indices into X_train_all / y_train_all
-    # so we can efficiently select patient groups during training.
-    #
-    print("  Building patient index ...")
-    t0 = time.time()
-    patient_indices = {}
-    for user in train_users:
-        patient_indices[user] = np.where(user_train == user)[0]
-    del user_train  # no longer needed
-    gc.collect()
-
-    total_indexed = sum(len(v) for v in patient_indices.values())
-    print(f"  Indexed {len(patient_indices)} patients, "
-          f"{total_indexed:,} rows  ({time.time()-t0:.1f}s)")
-    print()
-
-    # -- 7. Precompute balanced class weights ----------------------------------
+    # -- 6. Precompute balanced class weights ----------------------------------
     #
     # weight_k = n_total / (n_classes * n_k)
-    # 'balanced' class_weight is not supported with partial_fit, so we compute
-    # sample weights manually and pass them to each partial_fit call.
+    # We compute sample weights and pass them to fit().
     #
+    del user_train  # no longer needed (patient index not required with fit())
+    gc.collect()
     print("  Computing class weights ...")
     label_counts = np.bincount(y_train_all, minlength=N_CLASSES)
     n_train_total = label_counts.sum()
@@ -280,141 +265,133 @@ def train(args):
     # w is initialised to the zero vector at the first partial_fit call.
     # Each subsequent partial_fit call updates w and b incrementally.
     #
+    # -- 8. Scale ALL training data once (in-place to save memory) ------------
+    #
+    # Since all data is already in RAM, we scale it once and use clf.fit()
+    # instead of the chunked partial_fit approach.  clf.fit() internally
+    # shuffles and iterates for max_iter epochs with proper convergence
+    # detection — no manual epoch/chunk/batch loops needed.
+    #
+    print("  Scaling full training set in-place ...")
+    t0 = time.time()
+    X_train_scaled = scaler.transform(X_train_all)
+    del X_train_all  # free unscaled copy
+    gc.collect()
+    print(f"  Scaled ({time.time()-t0:.1f}s)")
+    print()
+
+    # -- 9. Kernel approximation (Nystroem) ------------------------------------
+    #
+    # A linear SVM cannot model the non-linear decision boundaries between
+    # gesture classes.  Nystroem maps the 72 features to a higher-dimensional
+    # space (n_components) where the RBF kernel is approximated by a linear
+    # inner product.  The subsequent linear SVM in this space is equivalent
+    # to an approximate RBF-kernel SVM in the original space.
+    #
+    # Complexity: O(n * n_components) for transform — much cheaper than the
+    # full O(n^2) kernel matrix.
+    #
+    kernel_map = None
+    if args.n_components > 0:
+        gamma_val = args.gamma if args.gamma else 1.0 / N_FEATURES
+        print(f"  Fitting Nystroem kernel approximation ...")
+        print(f"    n_components : {args.n_components}")
+        print(f"    gamma (RBF)  : {gamma_val:.6f}")
+        t0 = time.time()
+        kernel_map = Nystroem(
+            kernel="rbf",
+            gamma=gamma_val,
+            n_components=args.n_components,
+            random_state=42,
+        )
+        # Fit on a random subsample (Nystroem only needs n_components points
+        # to build the basis — using more is wasteful).
+        FIT_SAMPLE = min(args.n_components * 10, len(X_train_scaled))
+        rng_fit = np.random.RandomState(42)
+        fit_idx = rng_fit.choice(len(X_train_scaled), size=FIT_SAMPLE, replace=False)
+        kernel_map.fit(X_train_scaled[fit_idx])
+        print(f"  Kernel map fitted on {FIT_SAMPLE:,} samples  ({time.time()-t0:.1f}s)")
+
+        # Transform in batches to avoid allocating the full (n × n_components)
+        # matrix at once (which would exceed available RAM).
+        BATCH = 500_000
+        n_rows = len(X_train_scaled)
+        X_kernel = np.empty((n_rows, args.n_components), dtype=np.float32)
+        for bstart in range(0, n_rows, BATCH):
+            bend = min(bstart + BATCH, n_rows)
+            X_kernel[bstart:bend] = kernel_map.transform(
+                X_train_scaled[bstart:bend]
+            ).astype(np.float32)
+        del X_train_scaled
+        X_train_scaled = X_kernel
+        del X_kernel
+        gc.collect()
+        print(f"  Transform complete: {N_FEATURES} -> {X_train_scaled.shape[1]} dims  "
+              f"({time.time()-t0:.1f}s)")
+        print()
+
+    # -- 10. Compute per-sample weights (balanced class weighting) -------------
+    sample_weights = class_weight_array[y_train_all]
+
+    # -- 11. Initialise and train SGDClassifier --------------------------------
+    #
+    # SGDClassifier with loss='hinge' is a linear SVM solved via SGD.
+    # Using fit() instead of partial_fit() lets sklearn handle:
+    #   - proper data shuffling each epoch (all samples, not chunked)
+    #   - learning rate scheduling with correct per-epoch reset
+    #   - early stopping / convergence detection
+    #
     clf = SGDClassifier(
         loss="hinge",                      # Hinge loss = Linear SVM
         penalty="l2",                      # L2 reg -> minimise ||w||^2 (max margin)
         alpha=args.alpha,                  # lambda = 1/C  (regularisation strength)
         learning_rate=args.learning_rate,  # step-size schedule
-        eta0=0.01 if args.learning_rate == "constant" else 0.0,
+        eta0=0.01 if args.learning_rate != "optimal" else 0.0,
+        max_iter=args.epochs,              # number of full passes over the data
+        shuffle=True,                      # shuffle data before each epoch
         random_state=42,
-        warm_start=False,                  # we use partial_fit, not refit
-        verbose=0,
+        verbose=1,                         # print loss per epoch
+        n_jobs=-1,                         # use all cores
     )
 
-    # -- 9. Training epochs ----------------------------------------------------
     print(f"  Hyperparameters:")
     print(f"    alpha (lambda=1/C)   : {args.alpha}")
     print(f"    learning_rate        : {args.learning_rate}")
-    print(f"    batch_size           : {args.batch_size}")
-    print(f"    patients_per_chunk   : {args.chunk_size}")
-    print(f"    epochs               : {args.epochs}")
+    print(f"    max_iter (epochs)    : {args.epochs}")
+    print(f"    n_components (kernel): {args.n_components}")
     print()
     print("-" * 70)
 
-    rng = np.random.RandomState(42)
-    best_val_acc = 0.0
-    history = []
+    t0 = time.time()
+    clf.fit(X_train_scaled, y_train_all, sample_weight=sample_weights)
+    train_time = time.time() - t0
+    print(f"  Training completed in {train_time:.1f}s")
+    print()
 
-    for epoch in range(1, args.epochs + 1):
-        epoch_start = time.time()
+    # -- Validation ------------------------------------------------------------
+    print("  Evaluating on validation set ...")
+    val_acc, val_report = evaluate(clf, scaler, kernel_map, X_val, y_val, le)
+    best_val_acc = val_acc
 
-        # -- Shuffle PATIENT order every epoch ---------------------------------
-        # This decorrelates the gradient: different patient sequences prevent
-        # the SVM from "forgetting" earlier patients (catastrophic forgetting
-        # mitigation).  We shuffle patients, not chunk files.
-        patient_order = list(train_users)
-        rng.shuffle(patient_order)
+    history = [{
+        "epoch": args.epochs,
+        "val_acc": val_acc,
+        "n_samples": len(y_train_all),
+        "time_s": train_time,
+    }]
 
-        n_batches_total = 0
-        epoch_samples = 0
-        n_chunks = (len(patient_order) + args.chunk_size - 1) // args.chunk_size
-        chunk_idx = 0
+    # -- Save model ------------------------------------------------------------
+    joblib.dump(clf, MODELS_DIR / "svm_sgd_best.joblib")
+    joblib.dump(scaler, MODELS_DIR / "scaler_best.joblib")
+    joblib.dump(le, MODELS_DIR / "label_encoder.joblib")
+    if kernel_map is not None:
+        joblib.dump(kernel_map, MODELS_DIR / "kernel_map.joblib")
 
-        # -- Middle loop: group patients into chunks ---------------------------
-        for chunk_start in range(0, len(patient_order), args.chunk_size):
-            chunk_end = min(chunk_start + args.chunk_size, len(patient_order))
-            chunk_patients = patient_order[chunk_start:chunk_end]
-            chunk_idx += 1
-
-            # Gather row indices for all patients in this chunk
-            idx = np.concatenate([patient_indices[u] for u in chunk_patients])
-
-            # Select rows and scale
-            X_chunk = scaler.transform(X_train_all[idx])
-            y_chunk = y_train_all[idx]
-
-            # -- Shuffle windows within the chunk ------------------------------
-            # Mixes windows from different patients and gestures so that
-            # each mini-batch is a representative random sample.
-            X_chunk, y_chunk = sklearn_shuffle(
-                X_chunk, y_chunk, random_state=rng.randint(0, 2**31)
-            )
-
-            # -- Inner loop: mini-batches for partial_fit ----------------------
-            n_windows = len(X_chunk)
-            for batch_start in range(0, n_windows, args.batch_size):
-                batch_end = min(batch_start + args.batch_size, n_windows)
-                X_batch = X_chunk[batch_start:batch_end]
-                y_batch = y_chunk[batch_start:batch_end]
-
-                # Per-sample weights via numpy fancy indexing (fast)
-                sample_weight = class_weight_array[y_batch]
-
-                # partial_fit updates w and b using the hinge-loss gradient:
-                #   If y*(w.x + b) >= 1 (correct): w <- (1-eta*alpha)*w
-                #   If y*(w.x + b) <  1 (error)  : w <- (1-eta*alpha)*w + eta*y*x
-                #                                   b <- b + eta*y
-                clf.partial_fit(
-                    X_batch, y_batch,
-                    classes=classes,
-                    sample_weight=sample_weight,
-                )
-                n_batches_total += 1
-
-            epoch_samples += n_windows
-
-            # -- Progress update (inline, overwrite same line) ----------------
-            elapsed = time.time() - epoch_start
-            pct = chunk_idx / n_chunks * 100
-            bar_len = 30
-            filled = int(bar_len * chunk_idx // n_chunks)
-            bar = "#" * filled + "-" * (bar_len - filled)
-            sys.stdout.write(
-                f"\r  Epoch {epoch}/{args.epochs}  "
-                f"[{bar}] {pct:5.1f}%  "
-                f"chunk {chunk_idx}/{n_chunks}  "
-                f"{epoch_samples:,} samples  "
-                f"{elapsed:.0f}s"
-            )
-            sys.stdout.flush()
-
-            # Free chunk arrays
-            del X_chunk, y_chunk
-            gc.collect()
-
-        # Clear the progress line
-        sys.stdout.write("\r" + " " * 100 + "\r")
-        sys.stdout.flush()
-
-        # -- Epoch validation --------------------------------------------------
-        print(f"  Epoch {epoch}/{args.epochs}  Evaluating on validation set ...")
-        val_acc, val_report = evaluate(clf, scaler, X_val, y_val, le)
-        epoch_time = time.time() - epoch_start
-
-        history.append({
-            "epoch": epoch,
-            "val_acc": val_acc,
-            "n_batches": n_batches_total,
-            "n_samples": epoch_samples,
-            "time_s": epoch_time,
-        })
-
-        # -- Save best model ---------------------------------------------------
-        improved = ""
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            improved = "  * NEW BEST"
-            joblib.dump(clf, MODELS_DIR / "svm_sgd_best.joblib")
-            joblib.dump(scaler, MODELS_DIR / "scaler_best.joblib")
-            joblib.dump(le, MODELS_DIR / "label_encoder.joblib")
-
-        print(
-            f"  Epoch {epoch}/{args.epochs}  |  "
-            f"val_acc: {val_acc:.4f}  |  "
-            f"batches: {n_batches_total:,}  |  "
-            f"samples: {epoch_samples:,}  |  "
-            f"{epoch_time:.0f}s{improved}"
-        )
+    print(
+        f"  val_acc: {val_acc:.4f}  |  "
+        f"samples: {len(y_train_all):,}  |  "
+        f"{train_time:.0f}s"
+    )
 
     # -- 10. Final summary -----------------------------------------------------
     print()
@@ -422,17 +399,16 @@ def train(args):
     print(f"  Best validation accuracy: {best_val_acc:.4f}")
     print()
 
-    # Reload best model for final report
-    clf_best = joblib.load(MODELS_DIR / "svm_sgd_best.joblib")
-    val_acc, val_report = evaluate(clf_best, scaler, X_val, y_val, le)
-    print("  Classification Report (best model on validation set):")
+    print("  Classification Report (validation set):")
     print(val_report)
 
     # Confusion matrix
     y_pred_parts = []
     for start in range(0, len(X_val), 4096):
         X_b = scaler.transform(X_val[start : start + 4096])
-        y_pred_parts.append(clf_best.predict(X_b))
+        if kernel_map is not None:
+            X_b = kernel_map.transform(X_b)
+        y_pred_parts.append(clf.predict(X_b))
     y_pred = np.concatenate(y_pred_parts)
     cm = confusion_matrix(y_val, y_pred)
     print("  Confusion Matrix:")
@@ -446,9 +422,6 @@ def train(args):
         json.dump(history, f, indent=2)
     print(f"\n  Training history saved to: {history_path}")
 
-    # Save final model (last epoch, might differ from best)
-    joblib.dump(clf, MODELS_DIR / "svm_sgd_final.joblib")
-    joblib.dump(scaler, MODELS_DIR / "scaler_final.joblib")
     print(f"  Models saved to: {MODELS_DIR.resolve()}")
     print("=" * 70)
 
@@ -461,11 +434,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,
-                   help="Number of full passes over the training data.")
-    p.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
-                   help="Number of patients to group per training chunk.")
-    p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
-                   help="Mini-batch size for each partial_fit call.")
+                   help="Max number of SGD iterations (full passes) over the training data.")
     p.add_argument("--alpha", type=float, default=DEFAULT_ALPHA,
                    help="Regularization strength (lambda = 1/C). "
                         "Higher -> simpler model, wider margin.")
@@ -474,6 +443,12 @@ def parse_args():
                    help="Learning rate schedule for SGD.")
     p.add_argument("--val-frac", type=float, default=DEFAULT_VAL_FRAC,
                    help="Fraction of patients to reserve for validation.")
+    p.add_argument("--n-components", type=int, default=DEFAULT_N_COMPONENTS,
+                   help="Nystroem kernel approximation: number of RBF components. "
+                        "Set to 0 to disable (pure linear SVM).")
+    p.add_argument("--gamma", type=float, default=DEFAULT_GAMMA,
+                   help="RBF kernel bandwidth for Nystroem. "
+                        "None (default) = 1/n_features.")
     return p.parse_args()
 
 
