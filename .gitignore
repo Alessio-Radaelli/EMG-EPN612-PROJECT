@@ -44,6 +44,9 @@ Thumbs.db
 
 # Data files (large dataset - should be downloaded separately)
 EMG-EPN612 Dataset/
+training_chunks/
+training_set.parquet
+training_set_scaled.parquet
 
 # Model checkpoints and outputs
 *.h5
