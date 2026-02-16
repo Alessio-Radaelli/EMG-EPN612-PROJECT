@@ -48,7 +48,7 @@ WINDOW_SHIFT  = 10    # step size of the sliding window (10 samples @ 200 Hz = 5
 THRESHOLD     = 0.1   # amplitude threshold used by WAMP and ZC features (tuned for z-scored data)
 CHANNELS      = [f"ch{i}" for i in range(1, 9)]  # 8 EMG channels: "ch1" … "ch8"
 TD9_NAMES     = ["LS", "MFL", "MSR", "WAMP", "ZC", "RMS", "IAV", "DASDV", "VAR"]  # 9 time-domain features
-NUM_WORKERS   = 10    # max parallel processes (one per user)
+NUM_WORKERS   = 8    # max parallel processes (one per user)
 CHUNK_SIZE    = 10    # how many users to batch into one Parquet file
 
 # Build column names: 8 channels × 9 features = 72 feature columns
@@ -64,7 +64,7 @@ def filter_emg(emg_signal, fs=200, lowcut=20, highcut=95, notch_freq=50, notch_q
     """Apply bandpass + notch filtering only (no normalization).
     Normalization is handled later at the subject level.
 
-    Uses a 4th-order Butterworth IIR bandpass (20–95 Hz) instead of
+    Uses a 2th-order Butterworth IIR bandpass (20–95 Hz) instead of
     an FIR filter.  At fs=200 Hz the Nyquist frequency is 100 Hz,
     so highcut is set to 95 Hz to remain safely below Nyquist.
     """
@@ -72,7 +72,7 @@ def filter_emg(emg_signal, fs=200, lowcut=20, highcut=95, notch_freq=50, notch_q
     low  = lowcut  / nyquist                              # normalise low cutoff to [0, 1]
     high = highcut / nyquist                              # normalise high cutoff to [0, 1]
     # 4th-order Butterworth bandpass (effective 8th-order after filtfilt)
-    b_bp, a_bp = signal.butter(4, [low, high], btype="band")
+    b_bp, a_bp = signal.butter(2, [low, high], btype="band")
     filtered = signal.filtfilt(b_bp, a_bp, emg_signal)    # zero-phase bandpass filtering
     b_notch, a_notch = signal.iirnotch(w0=notch_freq, Q=notch_q, fs=fs)  # design 50 Hz notch filter
     filtered = signal.filtfilt(b_notch, a_notch, filtered) # zero-phase notch filtering (remove powerline)
