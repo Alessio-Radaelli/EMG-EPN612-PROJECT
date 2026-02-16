@@ -62,3 +62,7 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+
+# CUDA check utility
+check_cuda.py
+cuda_check_result.txt
