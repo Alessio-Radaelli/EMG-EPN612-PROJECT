@@ -49,8 +49,8 @@ TD9_NAMES     = ["LS", "MFL", "MSR", "WAMP", "ZC",
 NUM_WORKERS   = 8         # parallel worker processes
 CHUNK_SIZE    = 10        # users per Parquet chunk
 
-# noGesture: crop 1.3 s centred in the trial
-NO_GESTURE_CROP_SAMPLES = int(1.3 * FS)   # 260 samples
+# noGesture: fallback crop length if no gesture segments are available
+NO_GESTURE_CROP_FALLBACK = int(1.3 * FS)  # 260 samples
 
 # Outlier-detection thresholds
 IQR_VOTE_PCT  = 0.25      # >25 % of features out-of-bounds → BAD
@@ -80,11 +80,12 @@ def bandpass_filter(emg_signal, fs=FS, lowcut=20, highcut=95):
     return signal.filtfilt(b, a, emg_signal)
 
 
-def segment_trial(filtered_channels, sample_meta):
+def segment_trial(filtered_channels, sample_meta, no_gesture_crop=None):
     """Crop the filtered signal to the gesture region.
 
     For gestures   → use groundTruthIndex [start, end] (1-based → 0-based).
-    For noGesture  → crop 1.3 s from the centre of the trial.
+    For noGesture  → crop `no_gesture_crop` samples from the centre of the trial.
+                     If not provided, falls back to NO_GESTURE_CROP_FALLBACK.
 
     Returns a dict  {ch: np.array} with the cropped signals.
     """
@@ -97,9 +98,9 @@ def segment_trial(filtered_channels, sample_meta):
         end   = gti[1]                              # Python slice end (exclusive)
         return {ch: arr[start:end] for ch, arr in filtered_channels.items()}
     else:
-        # noGesture: take 1.3 s from the centre of the rest trial
+        # noGesture: take median-gesture-length from the centre of the trial
         length  = len(next(iter(filtered_channels.values())))
-        crop    = NO_GESTURE_CROP_SAMPLES
+        crop    = no_gesture_crop if no_gesture_crop else NO_GESTURE_CROP_FALLBACK
         centre  = length // 2
         start   = max(centre - crop // 2, 0)
         end     = start + crop
@@ -202,6 +203,14 @@ def process_user(user_folder):
     sample_keys = list(samples.keys())
     all_rows    = []
 
+    # Compute per-user median gesture length for noGesture cropping
+    gesture_lengths = []
+    for sk in sample_keys:
+        gti = samples[sk].get("groundTruthIndex")
+        if gti:
+            gesture_lengths.append(gti[1] - gti[0] + 1)
+    median_gesture_len = int(np.median(gesture_lengths)) if gesture_lengths else NO_GESTURE_CROP_FALLBACK
+
     for sample_key in sample_keys:
         sample = samples[sample_key]
         emg    = sample["emg"]
@@ -211,7 +220,7 @@ def process_user(user_folder):
         filtered = {ch: bandpass_filter(np.array(emg[ch])) for ch in CHANNELS}
 
         # Phase 1b — Segment (crop to gesture or centre-crop for noGesture)
-        cropped = segment_trial(filtered, sample)
+        cropped = segment_trial(filtered, sample, no_gesture_crop=median_gesture_len)
 
         # Phase 2 — Windowed TD9 feature extraction
         rows = windowed_features(cropped, gesture, user_folder, sample_key)
@@ -226,19 +235,22 @@ def process_user(user_folder):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def detect_outliers(df):
-    """Add 'is_bad_window' column using Subject-Specific IQR voting.
+    """Add 'is_bad_window' column using Subject- & Gesture-Specific IQR voting.
 
-    For each user independently:
+    For each (user, gesture) group independently:
       1. Compute Q1, Q3, IQR for every feature column.
       2. For each window, count how many features fall outside
          [Q1 - 1.5*IQR, Q3 + 1.5*IQR].
       3. Mark as BAD if >25 % of feature values are outside the fences.
+
+    Grouping by gesture avoids penalising gestures whose activation patterns
+    differ from the pooled distribution (e.g. strong fist vs. quiet noGesture).
     """
     df = df.copy()
     df["vote_count"]    = 0
     df["is_bad_window"] = False
 
-    for user, grp in df.groupby("user"):
+    for (user, label), grp in df.groupby(["user", "label"]):
         idx = grp.index
         feat_vals = grp[feature_columns].values              # (n_windows, 72)
 
@@ -270,6 +282,148 @@ def branch_datasets(df):
     dataset_svm = df.copy()
     dataset_dtw = df.copy()
     return dataset_svm, dataset_dtw
+
+
+def generate_outlier_report(df_flagged, output_dir):
+    """Generate and save outlier analysis reports (CSV).
+
+    Called after Phase 3 (outlier detection) and before Phase 4 (correction),
+    so the is_bad_window flag is present but no data has been removed yet.
+
+    Saves three files:
+      • outlier_report_by_gesture.csv   — per-gesture window & rep stats
+      • outlier_report_by_user.csv      — per-user   window & rep stats
+      • outlier_report_by_user_gesture.csv — full cross-tab
+    """
+    # ── Window-level stats per gesture ───────────────────────────────────
+    gesture_win_rows = []
+    for label, grp in df_flagged.groupby("label"):
+        n_total = len(grp)
+        n_bad   = int(grp["is_bad_window"].sum())
+        gesture_win_rows.append({
+            "gesture":          label,
+            "total_windows":    n_total,
+            "bad_windows":      n_bad,
+            "pct_bad_windows":  round(n_bad / n_total * 100, 2) if n_total else 0,
+        })
+    df_gesture_win = pd.DataFrame(gesture_win_rows).sort_values("gesture")
+
+    # ── Window-level stats per user ──────────────────────────────────────
+    user_win_rows = []
+    for user, grp in df_flagged.groupby("user"):
+        n_total = len(grp)
+        n_bad   = int(grp["is_bad_window"].sum())
+        user_win_rows.append({
+            "user":             user,
+            "total_windows":    n_total,
+            "bad_windows":      n_bad,
+            "pct_bad_windows":  round(n_bad / n_total * 100, 2) if n_total else 0,
+        })
+    df_user_win = pd.DataFrame(user_win_rows).sort_values(
+        "user", key=lambda s: s.str.replace("user", "").astype(int)
+    )
+
+    # ── Repetition-level stats (using DTW criteria) ──────────────────────
+    rep_records = []
+    for (user, sid), grp in df_flagged.groupby(["user", "sample_id"]):
+        grp        = grp.sort_values("window_idx")
+        label      = grp["label"].iloc[0]
+        bad_flags  = grp["is_bad_window"].values
+        n_windows  = len(bad_flags)
+        n_bad      = int(bad_flags.sum())
+        bad_ratio  = n_bad / n_windows if n_windows else 0
+        max_consec = _max_consecutive_true(bad_flags)
+
+        if n_bad == 0:
+            status = "clean"
+        elif bad_ratio > BAD_REP_PCT or max_consec >= BAD_CONSEC:
+            status = "dropped"
+        else:
+            status = "interpolated"
+
+        rep_records.append({
+            "user":                 user,
+            "sample_id":            sid,
+            "gesture":              label,
+            "total_windows":        n_windows,
+            "bad_windows":          n_bad,
+            "pct_bad":              round(bad_ratio * 100, 2),
+            "max_consecutive_bad":  max_consec,
+            "dtw_status":           status,
+        })
+
+    df_reps = pd.DataFrame(rep_records)
+
+    # Aggregate repetitions per gesture
+    gesture_rep_rows = []
+    for label, grp in df_reps.groupby("gesture"):
+        n_total        = len(grp)
+        n_clean        = int((grp["dtw_status"] == "clean").sum())
+        n_dropped      = int((grp["dtw_status"] == "dropped").sum())
+        n_interpolated = int((grp["dtw_status"] == "interpolated").sum())
+        gesture_rep_rows.append({
+            "gesture":            label,
+            "total_reps":         n_total,
+            "clean_reps":         n_clean,
+            "interpolated_reps":  n_interpolated,
+            "dropped_reps":       n_dropped,
+            "pct_dropped":        round(n_dropped / n_total * 100, 2) if n_total else 0,
+        })
+    df_gesture_reps = pd.DataFrame(gesture_rep_rows).sort_values("gesture")
+
+    # Aggregate repetitions per user
+    user_rep_rows = []
+    for user, grp in df_reps.groupby("user"):
+        n_total        = len(grp)
+        n_clean        = int((grp["dtw_status"] == "clean").sum())
+        n_dropped      = int((grp["dtw_status"] == "dropped").sum())
+        n_interpolated = int((grp["dtw_status"] == "interpolated").sum())
+        user_rep_rows.append({
+            "user":               user,
+            "total_reps":         n_total,
+            "clean_reps":         n_clean,
+            "interpolated_reps":  n_interpolated,
+            "dropped_reps":       n_dropped,
+            "pct_dropped":        round(n_dropped / n_total * 100, 2) if n_total else 0,
+        })
+    df_user_reps = pd.DataFrame(user_rep_rows).sort_values(
+        "user", key=lambda s: s.str.replace("user", "").astype(int)
+    )
+
+    # Merge window + rep stats into single reports
+    df_gesture_report = df_gesture_win.merge(df_gesture_reps, on="gesture")
+    df_user_report    = df_user_win.merge(df_user_reps, on="user")
+
+    # Detailed cross-tab: per (user, gesture)
+    ug_rows = []
+    for (user, gesture), grp in df_reps.groupby(["user", "gesture"]):
+        n_total        = len(grp)
+        n_dropped      = int((grp["dtw_status"] == "dropped").sum())
+        n_interpolated = int((grp["dtw_status"] == "interpolated").sum())
+        total_bad_win  = int(grp["bad_windows"].sum())
+        total_win      = int(grp["total_windows"].sum())
+        ug_rows.append({
+            "user":               user,
+            "gesture":            gesture,
+            "total_reps":         n_total,
+            "dropped_reps":       n_dropped,
+            "interpolated_reps":  n_interpolated,
+            "total_windows":      total_win,
+            "bad_windows":        total_bad_win,
+            "pct_bad_windows":    round(total_bad_win / total_win * 100, 2) if total_win else 0,
+        })
+    df_user_gesture = pd.DataFrame(ug_rows)
+
+    # ── Save CSVs ────────────────────────────────────────────────────────
+    path_gesture = output_dir / "outlier_report_by_gesture.csv"
+    path_user    = output_dir / "outlier_report_by_user.csv"
+    path_detail  = output_dir / "outlier_report_by_user_gesture.csv"
+
+    df_gesture_report.to_csv(path_gesture, index=False)
+    df_user_report.to_csv(path_user, index=False)
+    df_user_gesture.to_csv(path_detail, index=False)
+
+    return path_gesture, path_user, path_detail
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -471,6 +625,14 @@ def main():
           f"({n_bad_total/len(df)*100:.2f} %)  [{time.time()-t1:.1f}s]")
 
     dataset_svm, dataset_dtw = branch_datasets(df)
+
+    # Outlier audit reports (before any correction)
+    print("  Generating outlier audit reports …")
+    rpt_gesture, rpt_user, rpt_detail = generate_outlier_report(df, OUTPUT_DIR)
+    print(f"  → {rpt_gesture}")
+    print(f"  → {rpt_user}")
+    print(f"  → {rpt_detail}")
+
     del df
     gc.collect()
     print()

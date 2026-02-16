@@ -1,0 +1,7 @@
+gesture,total_windows,bad_windows,pct_bad_windows,total_reps,clean_reps,interpolated_reps,dropped_reps,pct_dropped
+fist,180610,979,0.54,7650,7321,164,165,2.16
+noGesture,171325,2647,1.55,7650,7337,89,224,2.93
+open,155749,969,0.62,7650,7299,199,152,1.99
+pinch,172392,586,0.34,7650,7415,148,87,1.14
+waveIn,175638,1500,0.85,7650,7122,267,261,3.41
+waveOut,183718,1149,0.63,7650,7245,213,192,2.51
