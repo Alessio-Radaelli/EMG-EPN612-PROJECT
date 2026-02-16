@@ -66,12 +66,12 @@ FEATURE_COLS = [f"{ch}_{feat}" for ch in CHANNELS for feat in TD9_NAMES]
 N_FEATURES   = len(FEATURE_COLS)  # 72
 
 # --- Defaults -----------------------------------------------------------------
-DEFAULT_D          = 10_000  # RFF output dimension (number of random features)
-DEFAULT_GAMMA      = "scale" # RBF bandwidth: 'scale' = 1/(d * Var(X))
-DEFAULT_C          = 1.0     # SVM regularization (inverse of weight decay)
-DEFAULT_EPOCHS     = 20
-DEFAULT_BATCH_SIZE = 4096
-DEFAULT_LR         = 0.01    # SGD learning rate
+DEFAULT_D          = 20_000  # RFF output dimension (20K sufficient for 72 features)
+DEFAULT_GAMMA      = "scale" # RBF bandwidth: 'scale' = 1/(d*Var(X)), standard heuristic
+DEFAULT_C          = 1.0     # SVM regularization: moderate for faster convergence
+DEFAULT_EPOCHS     = 50
+DEFAULT_BATCH_SIZE = 2048    # mini-batch size
+DEFAULT_LR         = 1e-2    # Adam LR (larger steps to escape flat regions)
 DEFAULT_VAL_FRAC   = 0.15
 
 
@@ -150,7 +150,7 @@ def train(args):
     if torch.cuda.is_available():
         device = torch.device("cuda")
         gpu_name = torch.cuda.get_device_name(0)
-        vram_gb = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
     else:
         device = torch.device("cpu")
         gpu_name = "CPU (no CUDA)"
@@ -242,18 +242,18 @@ def train(args):
 
     model = nn.Sequential(rff, linear).to(device)
 
-    # Weight decay on the linear layer = L2 regularization = 1/(2*C)
+    # Weight decay on the linear layer = L2 regularization = 1/(2*C*n)
     weight_decay = 1.0 / (2.0 * args.C * len(train_ds))
-    optimizer = torch.optim.SGD(
+    optimizer = torch.optim.Adam(
         linear.parameters(),       # only train the linear layer
         lr=args.lr,
-        momentum=0.9,
         weight_decay=weight_decay,
     )
 
-    # Learning rate scheduler: cosine annealing to 10% of initial LR
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.1
+    # Learning rate scheduler: reduce LR by 0.5× when val_acc plateaus
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-6,
+        verbose=True,
     )
 
     criterion = MulticlassHingeLoss()
@@ -290,12 +290,8 @@ def train(args):
             scores = model(X_batch)
 
             # Weighted hinge loss: scale per-sample loss by class weight
-            # Equivalent to class_weight='balanced' in sklearn
             batch_weights = class_weights[y_batch]
-            raw_loss = criterion(scores, y_batch)
 
-            # Weighted cross-batch: reweight the loss contribution
-            # (simpler: use class weights in the loss directly)
             n = scores.size(0)
             correct_scores = scores[torch.arange(n, device=device), y_batch]
             margins = scores - correct_scores.unsqueeze(1) + 1.0
@@ -310,11 +306,12 @@ def train(args):
             epoch_loss += loss.item()
             n_batches += 1
 
-        scheduler.step()
         elapsed = time.time() - t0_epoch
 
         # Validate
         val_acc = evaluate(model, val_loader, device)
+
+        scheduler.step(val_acc)   # ReduceLROnPlateau uses val metric
 
         if val_acc > best_acc:
             best_acc = val_acc
@@ -423,7 +420,7 @@ def parse_args():
     p.add_argument("--C", type=float, default=DEFAULT_C,
                    help="SVM regularization (inverse of weight decay).")
     p.add_argument("--lr", type=float, default=DEFAULT_LR,
-                   help="SGD learning rate.")
+                   help="Adam learning rate.")
     p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,
                    help="Training epochs.")
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
