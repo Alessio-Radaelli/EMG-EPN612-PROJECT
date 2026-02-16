@@ -74,13 +74,13 @@ N_FEATURES = len(FEATURE_COLS)  # 72
 
 # --- Default hyper-parameters -------------------------------------------------
 DEFAULT_EPOCHS       = 20      # full passes over the dataset
-DEFAULT_ALPHA        = 1e-4    # regularization strength (lambda = 1/C)
-DEFAULT_LEARNING_RATE = "invscaling"  # decaying step: eta = eta0 / t^0.25
-DEFAULT_ETA0         = 0.01    # initial learning rate
+DEFAULT_ALPHA        = 1e-6    # regularization strength (lambda = 1/C)
+DEFAULT_LEARNING_RATE = "constant"    # fixed step size (no decay during partial_fit)
+DEFAULT_ETA0         = 0.01    # constant learning rate
 DEFAULT_VAL_FRAC     = 0.15    # fraction of patients held out for validation
-DEFAULT_N_COMPONENTS = 1000    # Nystroem: number of RBF kernel features
-DEFAULT_GAMMA        = "0.1"   # Nystroem: RBF bandwidth (higher = more non-linear)
-DEFAULT_CHUNK_SIZE   = 500_000 # rows per disk chunk (~1.9 GB at 1000 components)
+DEFAULT_N_COMPONENTS = 2000    # Nystroem: number of RBF kernel features
+DEFAULT_GAMMA        = "0.03"  # Nystroem: RBF bandwidth (higher = sharper locality)
+DEFAULT_CHUNK_SIZE   = 250_000 # rows per disk chunk (~1.9 GB at 2000 components)
 
 
 # --- Helpers ------------------------------------------------------------------
@@ -254,6 +254,14 @@ def train(args):
         del X_train_all
         gc.collect()
         print(f"  Scaled ({time.time()-t0:.1f}s)")
+
+        # Shuffle rows so kernel chunks contain a mix of all users/classes.
+        # Important because partial_fit does NOT shuffle internally.
+        print("  Shuffling training rows ...")
+        rng_shuf = np.random.RandomState(42)
+        shuf_idx = rng_shuf.permutation(len(X_train_scaled))
+        X_train_scaled = X_train_scaled[shuf_idx]
+        y_train_all    = y_train_all[shuf_idx]
         print()
 
         # Fit Nystroem kernel map
@@ -274,10 +282,18 @@ def train(args):
                 n_components=args.n_components,
                 random_state=42,
             )
-            FIT_SAMPLE = min(args.n_components * 10, len(X_train_scaled))
+            # Stratified sampling: pick equal numbers of each class so
+            # the Nystroem basis vectors are well-balanced across classes.
+            FIT_PER_CLASS = min(10_000, len(X_train_scaled) // N_CLASSES)
+            FIT_SAMPLE = FIT_PER_CLASS * N_CLASSES    # e.g. 60 000
             rng_fit = np.random.RandomState(42)
-            fit_idx = rng_fit.choice(len(X_train_scaled), size=FIT_SAMPLE,
-                                     replace=False)
+            fit_idx = []
+            for c in range(N_CLASSES):
+                c_idx = np.where(y_train_all == c)[0]
+                fit_idx.append(rng_fit.choice(c_idx, size=FIT_PER_CLASS,
+                                              replace=False))
+            fit_idx = np.concatenate(fit_idx)
+            rng_fit.shuffle(fit_idx)
             kernel_map.fit(X_train_scaled[fit_idx])
             joblib.dump(kernel_map, kernel_map_path)
             print(f"  Kernel map fitted on {FIT_SAMPLE:,} samples  "

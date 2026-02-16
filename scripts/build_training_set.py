@@ -44,8 +44,8 @@ CHUNKS_DIR.mkdir(exist_ok=True)              # create output dir if it doesn't e
 
 # ── Parameters ─────────────────────────────────────────────────────────────────
 WINDOW_LENGTH = 40    # number of samples per sliding window (40 samples @ 200 Hz = 200 ms)
-WINDOW_SHIFT  = 5     # step size of the sliding window (5 samples @ 200 Hz = 25 ms)
-THRESHOLD     = 0.01  # amplitude threshold used by WAMP and ZC features
+WINDOW_SHIFT  = 10    # step size of the sliding window (10 samples @ 200 Hz = 50 ms, 75% overlap)
+THRESHOLD     = 0.1   # amplitude threshold used by WAMP and ZC features (tuned for z-scored data)
 CHANNELS      = [f"ch{i}" for i in range(1, 9)]  # 8 EMG channels: "ch1" … "ch8"
 TD9_NAMES     = ["LS", "MFL", "MSR", "WAMP", "ZC", "RMS", "IAV", "DASDV", "VAR"]  # 9 time-domain features
 NUM_WORKERS   = 10    # max parallel processes (one per user)
@@ -60,17 +60,20 @@ all_columns     = feature_columns + meta_columns
 
 
 # ── Signal preprocessing ─────────────────────────────────────────────────────
-def filter_emg(emg_signal, fs=200, lowcut=20, highcut=500, notch_freq=50, notch_q=30):
+def filter_emg(emg_signal, fs=200, lowcut=20, highcut=95, notch_freq=50, notch_q=30):
     """Apply bandpass + notch filtering only (no normalization).
-    Normalization is handled later at the subject level."""
+    Normalization is handled later at the subject level.
+
+    Uses a 4th-order Butterworth IIR bandpass (20–95 Hz) instead of
+    an FIR filter.  At fs=200 Hz the Nyquist frequency is 100 Hz,
+    so highcut is set to 95 Hz to remain safely below Nyquist.
+    """
     nyquist = fs / 2                                      # Nyquist freq = half the sampling rate
-    low = lowcut / nyquist                                # normalise low cutoff to [0, 1]
-    high = min(highcut, nyquist * 0.99) / nyquist         # normalise high cutoff, cap below Nyquist
-    low = max(0.001, min(low, 0.999))                     # clamp to valid range for firwin
-    high = max(low + 0.001, min(high, 0.999))             # ensure high > low
-    numtaps = 5                                           # FIR filter order (number of taps)
-    b_bp = signal.firwin(numtaps, [low, high], pass_zero=False)  # design bandpass FIR coefficients
-    filtered = signal.filtfilt(b_bp, [1.0], emg_signal)   # zero-phase bandpass filtering
+    low  = lowcut  / nyquist                              # normalise low cutoff to [0, 1]
+    high = highcut / nyquist                              # normalise high cutoff to [0, 1]
+    # 4th-order Butterworth bandpass (effective 8th-order after filtfilt)
+    b_bp, a_bp = signal.butter(4, [low, high], btype="band")
+    filtered = signal.filtfilt(b_bp, a_bp, emg_signal)    # zero-phase bandpass filtering
     b_notch, a_notch = signal.iirnotch(w0=notch_freq, Q=notch_q, fs=fs)  # design 50 Hz notch filter
     filtered = signal.filtfilt(b_notch, a_notch, filtered) # zero-phase notch filtering (remove powerline)
     return filtered                                       # return filtered signal (not normalised yet)
@@ -200,8 +203,10 @@ def process_user(user_folder):
                 extract_td9_array(norm_channels[ch][start:end])  # 9 features for one channel
                 for ch in CHANNELS                   # repeat for all 8 channels
             ])
-            # Append feature vector + metadata: [72 features, label, user, sample_id, window_start]
-            rows.append(np.append(feature_vec, [gesture, user_folder, sample_key, start]))
+            # Append feature vector + metadata as a Python list (avoids
+            # numpy dtype coercion from mixing floats and strings).
+            row = feature_vec.tolist() + [gesture, user_folder, sample_key, start]
+            rows.append(row)
 
     del user_data, samples, filtered_data            # free memory before returning
     return rows                                      # list of 76-element arrays (one per window)
