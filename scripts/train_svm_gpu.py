@@ -52,7 +52,7 @@ import joblib
 
 # --- Project paths ------------------------------------------------------------
 PROJECT_ROOT  = Path(__file__).resolve().parent.parent
-TRAINING_FILE = PROJECT_ROOT / "training_set.parquet"
+TRAINING_FILE = PROJECT_ROOT / "preprocessed_output" / "dataset_SVM.parquet"
 MODELS_DIR    = PROJECT_ROOT / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
@@ -66,12 +66,12 @@ FEATURE_COLS = [f"{ch}_{feat}" for ch in CHANNELS for feat in TD9_NAMES]
 N_FEATURES   = len(FEATURE_COLS)  # 72
 
 # --- Defaults -----------------------------------------------------------------
-DEFAULT_D          = 20_000  # RFF output dimension (20K sufficient for 72 features)
+DEFAULT_D          = 50_000  # RFF output dimension (20K sufficient for 72 features)
 DEFAULT_GAMMA      = "scale" # RBF bandwidth: 'scale' = 1/(d*Var(X)), standard heuristic
-DEFAULT_C          = 1.0     # SVM regularization: moderate for faster convergence
+DEFAULT_C          = 5.0     # SVM regularization: moderate for faster convergence
 DEFAULT_EPOCHS     = 50
-DEFAULT_BATCH_SIZE = 2048    # mini-batch size
-DEFAULT_LR         = 1e-2    # Adam LR (larger steps to escape flat regions)
+DEFAULT_BATCH_SIZE = 4096    # mini-batch size
+DEFAULT_LR         = 5e-2    # Adam LR (larger steps to escape flat regions)
 DEFAULT_VAL_FRAC   = 0.15
 
 
