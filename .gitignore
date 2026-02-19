@@ -66,3 +66,13 @@ logs/
 # CUDA check utility
 check_cuda.py
 cuda_check_result.txt
+
+# Scripts - helper/output files
+scripts/check_segment_lengths.py
+scripts/build_training_set.py
+scripts/precalculate_dtw_distances.py
+scripts/_verify_output.txt
+scripts/_dtw_help.txt
+
+# Precomputed DTW distances
+dtw_distances/
