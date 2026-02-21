@@ -1,6 +1,6 @@
 """
 DTW-KNN with k-Medoids Template Generation for EMG-EPN612 dataset.
-scricciola
+
 Two-phase algorithm:
   Phase 1 (Offline — Template Generation):
     1. Load the DTW-ready dataset (preprocessed, feature-extracted,
