@@ -48,7 +48,7 @@ import joblib
 
 # --- Project paths -----------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SVM_FILE     = PROJECT_ROOT / "preprocessed_output" / "dataset_SVM.parquet"
+SVM_FILE     = PROJECT_ROOT / "preprocessed_output" / "dataset_TRAINING.parquet"
 DTW_FILE     = PROJECT_ROOT / "preprocessed_output" / "dataset_DTW.parquet"
 MODELS_DIR   = PROJECT_ROOT / "models"
 MODELS_DIR.mkdir(exist_ok=True)
@@ -290,7 +290,7 @@ def run_cv_feature_selection(X, y, groups, n_folds=5, corr_thr=0.95,
     splits = list(gkf.split(X, y, groups))
 
     fold_scores = {m: [] for m in METHOD_NAMES}
-    n_workers = min(n_folds, os.cpu_count() or 4)
+    n_workers = min(n_folds, 2)  # Limit to 2 workers to reduce memory usage
 
     print(f"  Launching {n_folds} folds across {n_workers} worker processes ...")
 
@@ -517,26 +517,40 @@ def main(args):
         meta_cols = ["label", "user", "sample_id", "window_idx"]
         keep_cols = top_features + meta_cols
 
-        for src_path, tag in [(SVM_FILE, "SVM"), (DTW_FILE, "DTW")]:
-            if not src_path.exists():
-                print(f"  SKIP: {src_path.name} not found.")
-                continue
+        # Save reduced dataset with top 36 features
+        if SVM_FILE.exists():
             t0 = time.time()
-            df_src = pd.read_parquet(src_path)
-            # Verify all columns exist
+            df_src = pd.read_parquet(SVM_FILE)
             missing = [c for c in keep_cols if c not in df_src.columns]
             if missing:
-                print(f"  WARNING: {tag} missing columns: {missing}")
+                print(f"  WARNING: TRAINING missing columns: {missing}")
                 keep_cols_actual = [c for c in keep_cols if c in df_src.columns]
             else:
                 keep_cols_actual = keep_cols
 
-            out_path = src_path.parent / f"dataset_{tag}_reduced.parquet"
-            df_src[keep_cols_actual].to_parquet(out_path, index=False)
-            print(f"  → {out_path.name}  ({len(df_src):,} rows × "
+            out_path_36 = SVM_FILE.parent / "dataset_TRAINING_reduced36.parquet"
+            df_src[keep_cols_actual].to_parquet(out_path_36, index=False)
+            print(f"  → {out_path_36.name}  ({len(df_src):,} rows × "
                   f"{len(keep_cols_actual)} cols)  ({time.time()-t0:.1f}s)")
+
+            # Save reduced dataset with top 18 features
+            top_18_features = df_rank.head(18)["feature"].tolist()
+            keep_cols_18 = top_18_features + meta_cols
+            missing_18 = [c for c in keep_cols_18 if c not in df_src.columns]
+            if missing_18:
+                print(f"  WARNING: TRAINING missing columns for top 18: {missing_18}")
+                keep_cols_actual_18 = [c for c in keep_cols_18 if c in df_src.columns]
+            else:
+                keep_cols_actual_18 = keep_cols_18
+
+            out_path_18 = SVM_FILE.parent / "dataset_TRAINING_reduced18.parquet"
+            df_src[keep_cols_actual_18].to_parquet(out_path_18, index=False)
+            print(f"  → {out_path_18.name}  ({len(df_src):,} rows × "
+                  f"{len(keep_cols_actual_18)} cols)  ({time.time()-t0:.1f}s)")
             del df_src
             gc.collect()
+        else:
+            print(f"  SKIP: {SVM_FILE.name} not found.")
 
     # -- Done ------------------------------------------------------------------
     total = time.time() - t_start
