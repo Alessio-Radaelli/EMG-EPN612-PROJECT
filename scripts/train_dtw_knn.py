@@ -57,8 +57,9 @@ from tslearn.utils import to_time_series_dataset
 
 # --- Project paths ------------------------------------------------------------
 PROJECT_ROOT  = Path(__file__).resolve().parent.parent
-DTW_FILE      = PROJECT_ROOT / "preprocessed_output" / "dataset_DTW.parquet"
-MODELS_DIR    = PROJECT_ROOT / "models"
+DTW_TRAIN_FILE = PROJECT_ROOT / "preprocessed_output" / "dataset_DTW_TRAINING.parquet"
+DTW_TEST_FILE  = PROJECT_ROOT / "preprocessed_output" / "dataset_DTW_TEST.parquet"
+MODELS_DIR     = PROJECT_ROOT / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
 # --- Dataset constants --------------------------------------------------------
@@ -120,10 +121,13 @@ def load_and_reshape(parquet_path: Path, feature_cols: list):
     df = pd.read_parquet(parquet_path)
     print(f"  {len(df):,} rows x {len(df.columns)} cols  ({time.time()-t0:.1f}s)")
 
-    # Sort timing
+    # Sort by user, sample_id, window_idx, miniwindow_idx
     t_sort = time.time()
-    print("  Sorting by [user, sample_id, window_idx] ...")
-    df = df.sort_values(["user", "sample_id", "window_idx"])
+    sort_cols = ["user", "sample_id", "window_idx"]
+    if "miniwindow_idx" in df.columns:
+        sort_cols.append("miniwindow_idx")
+    print(f"  Sorting by {sort_cols} ...")
+    df = df.sort_values(sort_cols)
     print(f"  Sorted  ({time.time()-t_sort:.1f}s)")
 
     print("  Reshaping into 3D sequences ...")
@@ -802,53 +806,53 @@ def train(args):
     print("=" * 70)
     print(f"  Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Config: n_clusters={args.n_clusters}, radius={args.radius}, "
-          f"max_reps={args.max_reps}, val_frac={args.val_frac}, "
+          f"max_reps={args.max_reps}, "
           f"pca={args.pca}, clara_samples={args.clara_samples}, "
           f"grid_search={args.grid_search}")
 
     # -- 1. Load & reshape -----------------------------------------------------
     print(f"\n{'─'*70}")
-    print(f"  STEP 1/7: Loading & reshaping data")
+    print(f"  STEP 1/6: Loading & reshaping data")
     print(f"{'─'*70}")
-    if not DTW_FILE.exists():
-        print(f"  ERROR: {DTW_FILE} not found.", file=sys.stderr)
-        sys.exit(1)
+    for fpath in (DTW_TRAIN_FILE, DTW_TEST_FILE):
+        if not fpath.exists():
+            print(f"  ERROR: {fpath} not found.", file=sys.stderr)
+            print(f"  Run  python scripts/preprocess_dtw_pipeline.py  first.",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    sequences, labels, users, rep_ids = load_and_reshape(DTW_FILE, FEATURE_COLS)
+    print("  --- Training set ---")
+    X_train, y_train, users_train, _ = load_and_reshape(
+        DTW_TRAIN_FILE, FEATURE_COLS)
+    print("  --- Test set ---")
+    X_val, y_val, users_val, _ = load_and_reshape(
+        DTW_TEST_FILE, FEATURE_COLS)
 
     # -- 2. Label encoder ------------------------------------------------------
     print(f"\n{'─'*70}")
-    print(f"  STEP 2/7: Encoding labels")
+    print(f"  STEP 2/6: Encoding labels")
     print(f"{'─'*70}")
     le = LabelEncoder()
     le.fit(ALL_LABELS)
     print(f"  Classes ({N_CLASSES}): "
           f"{dict(zip(le.classes_, le.transform(le.classes_)))}")
 
-    # -- 3. Patient-level split ------------------------------------------------
-    print(f"\n{'─'*70}")
-    print(f"  STEP 3/7: Patient-level train/val split")
-    print(f"{'─'*70}")
-    train_set, val_set = split_patients(users, args.val_frac)
-    X_train, y_train, X_val, y_val = apply_split(
-        sequences, labels, users, train_set, val_set
-    )
-    del sequences; gc.collect()
+    n_train_users = len(np.unique(users_train))
+    n_val_users   = len(np.unique(users_val))
+    print(f"\n  Patients: {n_train_users + n_val_users} total  "
+          f"({n_train_users} train / {n_val_users} test)")
+    print(f"  Repetitions: {len(y_train):,} train / {len(y_val):,} test")
 
-    print(f"\n  Patients: {len(train_set) + len(val_set)} total  "
-          f"({len(train_set)} train / {len(val_set)} val)")
-    print(f"  Repetitions: {len(y_train):,} train / {len(y_val):,} val")
-
-    # -- 4. Report class distribution ------------------------------------------
-    print("\n  Train class distribution:")
+    # -- 3. Report class distribution ------------------------------------------
+    print("\n  Train/test class distribution:")
     for lbl in ALL_LABELS:
         n_train_lbl = np.sum(y_train == lbl)
         n_val_lbl = np.sum(y_val == lbl)
-        print(f"    {lbl:>12s}: {n_train_lbl:5d} train / {n_val_lbl:5d} val")
+        print(f"    {lbl:>12s}: {n_train_lbl:5d} train / {n_val_lbl:5d} test")
 
-    # -- 5. Subsample for tractability -----------------------------------------
+    # -- 4. Subsample for tractability -----------------------------------------
     print(f"\n{'─'*70}")
-    print(f"  STEP 4/7: Subsampling for tractability")
+    print(f"  STEP 3/6: Subsampling for tractability")
     print(f"{'─'*70}")
     if args.max_reps > 0:
         print(f"\n  Subsampling to {args.max_reps} reps/class for clustering ...")
@@ -869,22 +873,22 @@ def train(args):
             print(f"  TIP: Use --clara-samples 5 for scalable CLARA, "
                   f"or --max-reps 500 to subsample.")
 
-    # -- 5b. Optional PCA dimensionality reduction ----------------------------
+    # -- 4b. Optional PCA dimensionality reduction ----------------------------
     pca_obj = None
     if args.pca > 0:
         print(f"\n{'─'*70}")
-        print(f"  STEP 4b/7: PCA dimensionality reduction ({N_FEATURES} -> {args.pca})")
+        print(f"  STEP 3b/6: PCA dimensionality reduction ({N_FEATURES} -> {args.pca})")
         print(f"{'─'*70}")
         X_train_sub, pca_obj = apply_pca(X_train_sub, args.pca, pca=None)
         X_val, _ = apply_pca(X_val, args.pca, pca=pca_obj)
         print(f"  Train sequences: {len(X_train_sub)}, "
               f"feature dim: {X_train_sub[0].shape[1]}")
-        print(f"  Val   sequences: {len(X_val)}, "
+        print(f"  Test  sequences: {len(X_val)}, "
               f"feature dim: {X_val[0].shape[1]}")
 
-    # -- 6. Calculate safe Sakoe-Chiba radius ----------------------------------
+    # -- 5. Calculate safe Sakoe-Chiba radius ----------------------------------
     print(f"\n{'─'*70}")
-    print(f"  STEP 5/7: Calculating Sakoe-Chiba radius")
+    print(f"  STEP 4/6: Calculating Sakoe-Chiba radius")
     print(f"{'─'*70}")
     all_seqs = X_train_sub + X_val
     safe_radius = calculate_safe_radius(all_seqs)
@@ -899,9 +903,9 @@ def train(args):
                   f"{safe_radius}. Some DTW pairs may fail.")
         print(f"  Using manual radius: {radius}")
 
-    # -- 7. Run ----------------------------------------------------------------
+    # -- 6. Run ----------------------------------------------------------------
     print(f"\n{'─'*70}")
-    print(f"  STEP 6/7: {'Grid search' if args.grid_search else 'Training (single run)'}")
+    print(f"  STEP 5/6: {'Grid search' if args.grid_search else 'Training (single run)'}")
     print(f"{'─'*70}")
     t_train = time.time()
     if args.grid_search:
@@ -962,9 +966,9 @@ def train(args):
     train_elapsed = time.time() - t_train
     print(f"\n  Phase 1+2 completed in {_format_duration(train_elapsed)}")
 
-    # -- 8. Final report -------------------------------------------------------
+    # -- 7. Final report -------------------------------------------------------
     print(f"\n{'─'*70}")
-    print(f"  STEP 7/7: Results & saving")
+    print(f"  STEP 6/6: Results & saving")
     print(f"{'─'*70}")
     print(f"\n{'='*70}")
     print(f"  FINAL RESULTS")
@@ -1021,13 +1025,13 @@ def train(args):
         "n_templates": int(ref_X.shape[0]),
         "template_shape": list(ref_X.shape),
         "n_train_reps": len(y_train),
-        "n_val_reps": len(y_val),
+        "n_test_reps": len(y_val),
         "n_train_reps_used": len(y_train_sub),
         "max_reps_per_class": args.max_reps if args.max_reps > 0 else "all",
         "pca_components": args.pca if args.pca > 0 else "none",
         "clara_samples": args.clara_samples,
-        "n_train_patients": len(train_set),
-        "n_val_patients": len(val_set),
+        "n_train_patients": n_train_users,
+        "n_test_patients": n_val_users,
     }
     history_path = MODELS_DIR / "dtw_knn_history.json"
     with open(history_path, "w") as f:
@@ -1053,8 +1057,6 @@ def parse_args():
     p.add_argument("--radius", type=str, default=DEFAULT_RADIUS,
                    help="Sakoe-Chiba radius. 'auto' = calculated safe radius, "
                         "or an integer value.")
-    p.add_argument("--val-frac", type=float, default=DEFAULT_VAL_FRAC,
-                   help="Fraction of patients held out for validation.")
     p.add_argument("--max-reps", type=int, default=DEFAULT_MAX_REPS,
                    help="Max repetitions per class for clustering (0 = all). "
                         "k-Medoids with DTW is O(n^2), so limit this for "

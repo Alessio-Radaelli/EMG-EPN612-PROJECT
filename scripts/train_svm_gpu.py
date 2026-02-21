@@ -113,6 +113,18 @@ class MulticlassHingeLoss(nn.Module):
         # Mask correct class with -inf so it doesn't win the max
         margins = scores - correct_scores.unsqueeze(1) + 1.0
         margins[torch.arange(n, device=scores.device), targets] = 0.0
+        
+        # -------------------------------------------------------------------------
+        # MATHEMATICAL EQUIVALENCY: THE SOFT MARGIN (SLACK VARIABLES)
+        # In classic SVM theory, the soft margin introduces a slack variable (xi) 
+        # to measure how far a point is on the wrong side of the margin boundary.
+        #
+        # Here, the `margins.clamp(min=0)` operation calculates that exact slack.
+        # - If a point respects the margin (difference is <= 0), it clamps to 0. 
+        #   The model ignores it (xi = 0).
+        # - If a point violates the margin, the positive value represents the 
+        #   slack (xi > 0), which the optimizer will actively try to minimize.
+        # -------------------------------------------------------------------------
         loss = margins.clamp(min=0).max(dim=1)[0]
         return loss.mean()
 
@@ -231,19 +243,33 @@ def train(args):
                               num_workers=0)
 
     # -- 9. Build model --------------------------------------------------------
-    #
-    #   Input (72) → RFF (D, fixed) → Linear (D → 6)
-    #
-    # The RFF layer is frozen.  Only the linear layer is trained.
-    # This is mathematically equivalent to an RBF-SVM.
-    #
     rff = RandomFourierFeatures(N_FEATURES, args.D, gamma_val)
     linear = nn.Linear(args.D, N_CLASSES)
 
+    # -------------------------------------------------------------------------
+    # MATHEMATICAL EQUIVALENCY: THE HYPOTHESIS FUNCTION (HYPERPLANE)
+    # A linear SVM classifies points by computing f(x) = Wx + b.
+    # The `nn.Linear` module performs this exact affine transformation. 
+    # Because the RFF layer is frozen, the input 'x' is statically mapped 
+    # to a high-dimensional space. The `nn.Linear` layer simply acts as the 
+    # classical Support Vector Machine hyperplane solver in that new space.
+    # -------------------------------------------------------------------------
     model = nn.Sequential(rff, linear).to(device)
 
-    # Weight decay on the linear layer = L2 regularization = 1/(2*C*n)
+    # -------------------------------------------------------------------------
+    # MATHEMATICAL EQUIVALENCY: REGULARIZATION (THE 'C' PARAMETER)
+    # A standard soft-margin SVM minimizes: (1/2)||W||^2 + C * sum(xi)
+    # However, PyTorch's loss function calculates the *mean* error: (1/n) * sum(xi).
+    #
+    # To mathematically align the PyTorch objective with the SVM objective, 
+    # we divide the classic equation by (C * n). This transforms the L2 
+    # regularization term into: 1 / (2 * C * n) * ||W||^2. 
+    #
+    # Therefore, applying this specific weight_decay via the optimizer strictly 
+    # enforces the classical SVM 'C' parameter.
+    # -------------------------------------------------------------------------
     weight_decay = 1.0 / (2.0 * args.C * len(train_ds))
+    
     optimizer = torch.optim.Adam(
         linear.parameters(),       # only train the linear layer
         lr=args.lr,
