@@ -1,7 +1,7 @@
-gesture,total_windows,bad_windows,pct_bad_windows,total_reps,clean_reps,interpolated_reps,dropped_reps,pct_dropped
-fist,180610,979,0.54,7650,7321,164,165,2.16
-noGesture,171325,2647,1.55,7650,7337,89,224,2.93
-open,155749,969,0.62,7650,7299,199,152,1.99
-pinch,172392,586,0.34,7650,7415,148,87,1.14
-waveIn,175638,1500,0.85,7650,7122,267,261,3.41
-waveOut,183718,1149,0.63,7650,7245,213,192,2.51
+gesture,total_windows,bad_windows,pct_bad_windows,total_registrations,reps_with_outliers,pct_reps_affected
+fist,270195,1822,0.67,11475,598,5.21
+noGesture,254975,3883,1.52,11475,464,4.04
+open,233222,1623,0.7,11475,601,5.24
+pinch,257634,880,0.34,11475,355,3.09
+waveIn,262183,2612,1.0,11475,885,7.71
+waveOut,271389,1818,0.67,11475,637,5.55

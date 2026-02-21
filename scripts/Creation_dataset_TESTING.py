@@ -1,43 +1,38 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# EMG-EPN612 -- Preprocessing Pipeline  (dataset_A -> dataset_TRAINING)
+# EMG-EPN612 -- Testing Pipeline  (dataset_B -> dataset_TEST)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Five-phase pipeline:
+# Three-phase pipeline (no outlier detection/removal):
 #   Phase 1  Signal Conditioning (bandpass + 50 Hz notch) & Segmentation
 #   Phase 2  TD9 Feature Extraction (72 features per window)
-#   Phase 3  Outlier Detection (IQR voting)
-#   Phase 4  Outlier Removal (drop bad windows)
-#   Phase 5  Subject-Specific Z-Score Normalization
+#   Phase 3  Subject-Specific Z-Score Normalization
 #
-# Input : datasets/dataset_A.pkl  (459 users, 150 registrations each)
-# Output: preprocessed_output/dataset_TRAINING.parquet
+# Input : datasets/dataset_B.pkl  (153 users, 150 registrations each)
+# Output: preprocessed_output/dataset_TEST.parquet
 #
-# Dataset JSON key layout (per user inside the pkl):
-#   trainingSamples -> idx_N -> gestureName        (str)
-#                            -> emg -> ch1..ch8    (list[float])
-#                            -> groundTruthIndex   [start, end]  (1-based)
-#                            -> groundTruth        list[0|1]
-#   (noGesture samples have NO groundTruthIndex / groundTruth keys)
+# Expected verification:
+#   - 153 unique users
+#   - 22,950 total repetitions  (153 × 150)
+#   - 76 columns  (72 EMG features + 4 metadata)
 #
 # Usage:
 #   cd <project root>
-#   python scripts/preprocess_pipeline.py
+#   python scripts/Creation_dataset_TESTING.py
 # ══════════════════════════════════════════════════════════════════════════════
 
-import json
+import gc
 import os
+import pickle
 import sys
 import time
-import gc
-import pickle
+
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from scipy import signal
-from concurrent.futures import ProcessPoolExecutor
 
 # -- Paths (relative to project root) ----------------------------------------
-DATASET_A_PATH = Path("datasets") / "dataset_A.pkl"
+DATASET_B_PATH = Path("datasets") / "dataset_B.pkl"
 OUTPUT_DIR     = Path("preprocessed_output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -49,14 +44,9 @@ THRESHOLD     = 0.00001   # 10 uV threshold for WAMP / ZC (noise floor)
 CHANNELS      = [f"ch{i}" for i in range(1, 9)]  # ch1 .. ch8
 TD9_NAMES     = ["LS", "MFL", "MSR", "WAMP", "ZC",
                  "RMS", "IAV", "DASDV", "VAR"]
-NUM_WORKERS   = 8         # parallel worker processes
-CHUNK_SIZE    = 10        # users per processing chunk
 
 # noGesture: fallback crop length if no gesture segments are available
 NO_GESTURE_CROP_FALLBACK = int(1.3 * FS)  # 260 samples
-
-# Outlier-detection thresholds
-IQR_VOTE_PCT  = 0.25      # >25 % of features out-of-bounds -> BAD
 
 # Column names
 feature_columns = [f"{ch}_{feat}" for ch in CHANNELS for feat in TD9_NAMES]
@@ -194,11 +184,9 @@ def windowed_features(cropped_channels, label, user, sample_id):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Per-user worker (Phases 1 + 2, no normalisation yet)
+# Per-user worker (Phases 1 + 2)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# -- Global holder for user data passed to workers ---------------------------
-# (set by main before launching the pool; workers inherit via fork/spawn)
 _USER_DATA_STORE = {}
 
 
@@ -207,11 +195,10 @@ def process_user(user_id):
 
     Reads from _USER_DATA_STORE[user_id] (trainingSamples dict).
     Returns a list of 76-element rows (features + metadata).
-    Normalisation is deferred to Phase 5 (after outlier handling).
     """
     samples     = _USER_DATA_STORE[user_id]
     sample_keys = list(samples.keys())
-    user_label  = f"user{user_id}"      # consistent with folder-style naming
+    user_label  = f"user{user_id}"
     all_rows    = []
 
     # Compute per-user median gesture length for noGesture cropping
@@ -243,208 +230,13 @@ def process_user(user_id):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 3 — Outlier Detection & Branching
-# ══════════════════════════════════════════════════════════════════════════════
-
-def detect_outliers(df):
-    """Add 'is_bad_window' column using Subject- & Gesture-Specific IQR voting.
-
-    For each (user, gesture) group independently:
-      1. Compute Q1, Q3, IQR for every feature column.
-      2. For each window, count how many features fall outside
-         [Q1 - 1.5*IQR, Q3 + 1.5*IQR].
-      3. Mark as BAD if >25 % of feature values are outside the fences.
-
-    Grouping by gesture avoids penalising gestures whose activation patterns
-    differ from the pooled distribution (e.g. strong fist vs. quiet noGesture).
-    """
-    df = df.copy()
-    df["vote_count"]    = 0
-    df["is_bad_window"] = False
-
-    for (user, label), grp in df.groupby(["user", "label"]):
-        idx = grp.index
-        feat_vals = grp[feature_columns].values              # (n_windows, 72)
-
-        q1  = np.percentile(feat_vals, 25, axis=0)           # (72,)
-        q3  = np.percentile(feat_vals, 75, axis=0)           # (72,)
-        iqr = q3 - q1                                        # (72,)
-
-        lower = q1 - 1.5 * iqr                               # (72,)
-        upper = q3 + 1.5 * iqr                               # (72,)
-
-        outside = (feat_vals < lower) | (feat_vals > upper)   # bool (n, 72)
-        votes   = outside.sum(axis=1)                         # (n,)
-
-        n_feats = len(feature_columns)                        # 72
-        bad     = votes > (IQR_VOTE_PCT * n_feats)            # >18 features OOB
-
-        df.loc[idx, "vote_count"]    = votes
-        df.loc[idx, "is_bad_window"] = bad
-
-    return df
-
-
-def generate_outlier_report(df_flagged, output_dir):
-    """Generate, print, and save outlier analysis reports (CSV).
-
-    Saves three files:
-      - outlier_report_by_gesture.csv       -- per-gesture window stats
-      - outlier_report_by_user.csv          -- per-user   window stats
-      - outlier_report_by_user_gesture.csv  -- per (user, gesture) cross-tab
-
-    Also prints a detailed console summary.
-    """
-    n_total_all = len(df_flagged)
-    n_bad_all   = int(df_flagged["is_bad_window"].sum())
-
-    # -- Window-level stats per gesture -----------------------------------
-    gesture_rows = []
-    for label, grp in df_flagged.groupby("label"):
-        n_total = len(grp)
-        n_bad   = int(grp["is_bad_window"].sum())
-        # count how many registrations have at least 1 bad window
-        reps_with_bad = 0
-        for (_, sid), rep_grp in grp.groupby(["user", "sample_id"]):
-            if rep_grp["is_bad_window"].any():
-                reps_with_bad += 1
-        total_reps = grp.groupby(["user", "sample_id"]).ngroups
-        gesture_rows.append({
-            "gesture":              label,
-            "total_windows":        n_total,
-            "bad_windows":          n_bad,
-            "pct_bad_windows":      round(n_bad / n_total * 100, 2) if n_total else 0,
-            "total_registrations":  total_reps,
-            "reps_with_outliers":   reps_with_bad,
-            "pct_reps_affected":    round(reps_with_bad / total_reps * 100, 2) if total_reps else 0,
-        })
-    df_gesture = pd.DataFrame(gesture_rows).sort_values("gesture")
-
-    # -- Window-level stats per user --------------------------------------
-    user_rows = []
-    for user, grp in df_flagged.groupby("user"):
-        n_total = len(grp)
-        n_bad   = int(grp["is_bad_window"].sum())
-        total_reps = grp["sample_id"].nunique()
-        reps_with_bad = 0
-        for sid, rep_grp in grp.groupby("sample_id"):
-            if rep_grp["is_bad_window"].any():
-                reps_with_bad += 1
-        user_rows.append({
-            "user":                 user,
-            "total_windows":        n_total,
-            "bad_windows":          n_bad,
-            "pct_bad_windows":      round(n_bad / n_total * 100, 2) if n_total else 0,
-            "total_registrations":  total_reps,
-            "reps_with_outliers":   reps_with_bad,
-            "pct_reps_affected":    round(reps_with_bad / total_reps * 100, 2) if total_reps else 0,
-        })
-    df_user = pd.DataFrame(user_rows).sort_values(
-        "user", key=lambda s: s.str.replace("user", "").astype(int)
-    )
-
-    # -- Per (user, gesture) cross-tab ------------------------------------
-    ug_rows = []
-    for (user, label), grp in df_flagged.groupby(["user", "label"]):
-        n_total = len(grp)
-        n_bad   = int(grp["is_bad_window"].sum())
-        total_reps = grp["sample_id"].nunique()
-        reps_with_bad = 0
-        for sid, rep_grp in grp.groupby("sample_id"):
-            if rep_grp["is_bad_window"].any():
-                reps_with_bad += 1
-        ug_rows.append({
-            "user":                 user,
-            "gesture":              label,
-            "total_windows":        n_total,
-            "bad_windows":          n_bad,
-            "pct_bad_windows":      round(n_bad / n_total * 100, 2) if n_total else 0,
-            "total_registrations":  total_reps,
-            "reps_with_outliers":   reps_with_bad,
-        })
-    df_user_gesture = pd.DataFrame(ug_rows)
-
-    # -- Save CSVs --------------------------------------------------------
-    path_gesture = output_dir / "outlier_report_by_gesture.csv"
-    path_user    = output_dir / "outlier_report_by_user.csv"
-    path_detail  = output_dir / "outlier_report_by_user_gesture.csv"
-
-    df_gesture.to_csv(path_gesture, index=False)
-    df_user.to_csv(path_user, index=False)
-    df_user_gesture.to_csv(path_detail, index=False)
-
-    # -- Console summary --------------------------------------------------
-    print()
-    print("  " + "-" * 68)
-    print("  OUTLIER ANALYSIS SUMMARY")
-    print("  " + "-" * 68)
-    print(f"  Total windows        : {n_total_all:,}")
-    print(f"  Bad windows (removed): {n_bad_all:,}  "
-          f"({n_bad_all/n_total_all*100:.2f} %)")
-    print()
-
-    # Per-gesture table
-    print("  --- By Gesture " + "-" * 51)
-    print(f"  {'Gesture':<14} {'Total':>10} {'Bad':>8} {'%Bad':>7}  "
-          f"{'Regs':>6} {'Affected':>8} {'%Aff':>6}")
-    for _, r in df_gesture.iterrows():
-        print(f"  {r['gesture']:<14} {r['total_windows']:>10,} {r['bad_windows']:>8,} "
-              f"{r['pct_bad_windows']:>6.2f}%  "
-              f"{r['total_registrations']:>6} {r['reps_with_outliers']:>8} "
-              f"{r['pct_reps_affected']:>5.1f}%")
-    print()
-
-    # Per-user summary (top 10 worst + distribution stats)
-    print("  --- By User (top 10 worst) " + "-" * 40)
-    print(f"  {'User':<12} {'Total':>10} {'Bad':>8} {'%Bad':>7}  "
-          f"{'Regs':>6} {'Affected':>8}")
-    top10 = df_user.nlargest(10, "pct_bad_windows")
-    for _, r in top10.iterrows():
-        print(f"  {r['user']:<12} {r['total_windows']:>10,} {r['bad_windows']:>8,} "
-              f"{r['pct_bad_windows']:>6.2f}%  "
-              f"{r['total_registrations']:>6} {r['reps_with_outliers']:>8}")
-
-    # Distribution of user-level bad %
-    pcts = df_user["pct_bad_windows"]
-    n_zero  = int((pcts == 0).sum())
-    n_low   = int(((pcts > 0) & (pcts <= 1)).sum())
-    n_mid   = int(((pcts > 1) & (pcts <= 3)).sum())
-    n_high  = int((pcts > 3).sum())
-    print()
-    print("  --- User outlier-rate distribution ---")
-    print(f"    0% outliers         : {n_zero} users")
-    print(f"    (0%, 1%] outliers   : {n_low} users")
-    print(f"    (1%, 3%] outliers   : {n_mid} users")
-    print(f"    >3% outliers        : {n_high} users")
-    print(f"    mean % bad/user     : {pcts.mean():.2f}%")
-    print(f"    median % bad/user   : {pcts.median():.2f}%")
-    print(f"    max % bad/user      : {pcts.max():.2f}%")
-    print("  " + "-" * 68)
-
-    return path_gesture, path_user, path_detail
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 4 — Outlier Correction & Analysis
-# ══════════════════════════════════════════════════════════════════════════════
-
-def correct_outliers(df):
-    """Drop all windows flagged as outliers (bad windows)."""
-    n_before = len(df)
-    df_clean = df[~df["is_bad_window"]].copy()
-    n_after  = len(df_clean)
-    pct_drop = (n_before - n_after) / n_before * 100 if n_before else 0
-    return df_clean, pct_drop
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 5 — Subject-Specific Z-Score Normalization
+# PHASE 3 — Subject-Specific Z-Score Normalization
 # ══════════════════════════════════════════════════════════════════════════════
 
 def zscore_normalize(df):
     """Apply per-subject Z-score to all 72 feature columns.
 
-    For each user, µ and σ are computed from that user's cleaned data.
+    For each user, µ and σ are computed from that user's data.
     """
     df = df.copy()
     for user, grp in df.groupby("user"):
@@ -464,27 +256,25 @@ def main():
     global _USER_DATA_STORE
 
     # ------------------------------------------------------------------
-    # Load dataset_A.pkl
+    # Load dataset_B.pkl
     # ------------------------------------------------------------------
     print("=" * 72)
-    print("  EMG-EPN612 Preprocessing Pipeline  (dataset_A -> dataset_TRAINING)")
+    print("  EMG-EPN612 Testing Pipeline  (dataset_B -> dataset_TEST)")
     print("=" * 72)
 
-    print(f"\n  Loading {DATASET_A_PATH} ...")
+    print(f"\n  Loading {DATASET_B_PATH} ...")
     t_load = time.time()
-    with open(DATASET_A_PATH, "rb") as f:
-        dataset_a = pickle.load(f)       # {overall_user_id: trainingSamples}
-    total_users = len(dataset_a)
+    with open(DATASET_B_PATH, "rb") as f:
+        dataset_b = pickle.load(f)       # {overall_user_id: trainingSamples}
+    total_users = len(dataset_b)
     print(f"  Loaded {total_users} users in {time.time()-t_load:.1f}s")
 
-    user_ids = sorted(dataset_a.keys())  # sorted overall user ids
+    user_ids = sorted(dataset_b.keys())
 
-    print(f"  Workers        : {NUM_WORKERS}")
     print(f"  Window         : {WINDOW_LENGTH} samples ({WINDOW_LENGTH/FS*1000:.0f} ms)")
     print(f"  Step           : {WINDOW_SHIFT} samples ({WINDOW_SHIFT/FS*1000:.0f} ms)")
     print(f"  Filter         : bandpass 20-95 Hz + 50 Hz notch")
     print(f"  WAMP/ZC thr    : {THRESHOLD}")
-    print(f"  IQR vote thr   : {IQR_VOTE_PCT*100:.0f} % of 72 features")
     print(f"  Output dir     : {OUTPUT_DIR.resolve()}")
     print(f"  CPU cores      : {os.cpu_count()}")
     print()
@@ -497,10 +287,8 @@ def main():
     BAR_W    = 40
     all_rows = []
 
-    # Process users sequentially (data is already in memory; avoids
-    # pickling multi-GB data to worker processes)
     for i, uid in enumerate(user_ids):
-        _USER_DATA_STORE = {uid: dataset_a[uid]}
+        _USER_DATA_STORE = {uid: dataset_b[uid]}
         rows = process_user(uid)
         all_rows.extend(rows)
 
@@ -519,11 +307,11 @@ def main():
         sys.stdout.flush()
 
         # Free memory for processed user
-        del dataset_a[uid]
+        del dataset_b[uid]
         if (i + 1) % 50 == 0:
             gc.collect()
 
-    del dataset_a
+    del dataset_b
     _USER_DATA_STORE = {}
     gc.collect()
 
@@ -537,89 +325,67 @@ def main():
     print()
 
     # ==================================================================
-    # PHASE 3 -- Outlier Detection
+    # PHASE 3 -- Subject-Specific Z-Score Normalization
     # ==================================================================
-    print("> Phase 3: Outlier detection (IQR voting) ...")
+    print("> Phase 3: Z-score normalization (per subject) ...")
     t1 = time.time()
-    df = detect_outliers(df)
-    n_bad_total = int(df["is_bad_window"].sum())
-    print(f"  -> {n_bad_total:,} / {len(df):,} windows flagged as BAD "
-          f"({n_bad_total/len(df)*100:.2f} %)  [{time.time()-t1:.1f}s]")
-
-    # Outlier audit reports (before removal)
-    print("  Generating outlier audit reports ...")
-    rpt_gesture, rpt_user, rpt_detail = generate_outlier_report(df, OUTPUT_DIR)
-    print(f"  -> {rpt_gesture}")
-    print(f"  -> {rpt_user}")
-    print(f"  -> {rpt_detail}")
-    print()
-
-    # ==================================================================
-    # PHASE 4 -- Outlier Removal (drop bad windows)
-    # ==================================================================
-    print("> Phase 4: Outlier removal (drop bad windows) ...")
-    t2 = time.time()
-    dataset_training, pct_drop = correct_outliers(df)
-    print(f"  -> {pct_drop:.2f} % windows dropped  ->  {len(dataset_training):,} remain")
-    print(f"  [{time.time()-t2:.1f}s]")
-
+    dataset_test = zscore_normalize(df)
     del df
     gc.collect()
-    print()
-
-    # ==================================================================
-    # PHASE 5 -- Subject-Specific Z-Score Normalization
-    # ==================================================================
-    print("> Phase 5: Z-score normalization (per subject) ...")
-    t3 = time.time()
-    dataset_training = zscore_normalize(dataset_training)
-    print(f"  [{time.time()-t3:.1f}s]")
+    print(f"  [{time.time()-t1:.1f}s]")
     print()
 
     # ==================================================================
     # Save output
     # ==================================================================
     print("> Saving ...")
-
-    # Drop helper columns before saving
-    drop_cols = ["vote_count", "is_bad_window"]
-    for c in drop_cols:
-        if c in dataset_training.columns:
-            dataset_training.drop(columns=c, inplace=True)
-
-    out_path = OUTPUT_DIR / "dataset_TRAINING.parquet"
-    dataset_training.to_parquet(out_path, index=False)
+    out_path = OUTPUT_DIR / "dataset_TEST.parquet"
+    dataset_test.to_parquet(out_path, index=False)
 
     total_elapsed = time.time() - t0
-    print(f"  -> {out_path}  ({len(dataset_training):,} rows)")
+    print(f"  -> {out_path}  ({len(dataset_test):,} rows)")
     print()
 
     # ==================================================================
     # Verification summary
     # ==================================================================
-    n_users = dataset_training["user"].nunique()
-    n_cols  = len(dataset_training.columns)
-    feat_c  = [c for c in dataset_training.columns if c in feature_columns]
-    meta_c  = [c for c in dataset_training.columns if c in meta_columns]
+    n_users   = dataset_test["user"].nunique()
+    n_cols    = len(dataset_test.columns)
+    feat_c    = [c for c in dataset_test.columns if c in feature_columns]
+    meta_c    = [c for c in dataset_test.columns if c in meta_columns]
+    total_reps = dataset_test.groupby(["user", "sample_id"]).ngroups
 
     print("=" * 72)
     print("  VERIFICATION")
     print("=" * 72)
-    print(f"  Unique users            : {n_users}")
-    print(f"  Total rows (windows)    : {len(dataset_training):,}")
+    print(f"  Unique users            : {n_users}   "
+          f"{'[OK]' if n_users == 153 else '[FAIL — expected 153]'}")
+    print(f"  Total repetitions       : {total_reps:,}   "
+          f"{'[OK]' if total_reps == 22950 else '[FAIL — expected 22,950]'}")
     print(f"  Total columns           : {n_cols}  "
-          f"({len(feat_c)} features + {len(meta_c)} meta)")
+          f"({len(feat_c)} features + {len(meta_c)} meta)   "
+          f"{'[OK]' if n_cols == 76 else '[FAIL — expected 76]'}")
+    print(f"  Total rows (windows)    : {len(dataset_test):,}")
     print(f"  Feature columns         : {feat_c[:3]} ... {feat_c[-3:]}")
     print(f"  Meta columns            : {meta_c}")
 
     # Per-user registration count
-    reg_per_user = (dataset_training
+    reg_per_user = (dataset_test
                     .groupby("user")["sample_id"]
                     .nunique())
     print(f"  Registrations per user  : min={reg_per_user.min()}, "
           f"max={reg_per_user.max()}, median={reg_per_user.median():.0f}")
     print(f"  Gestures found          : "
-          f"{sorted(dataset_training['label'].unique())}")
+          f"{sorted(dataset_test['label'].unique())}")
+    print()
+
+    # Final pass/fail
+    all_ok = (n_users == 153) and (total_reps == 22950) and (n_cols == 76)
+    if all_ok:
+        print("  *** ALL VERIFICATION CHECKS PASSED ***")
+    else:
+        print("  *** SOME VERIFICATION CHECKS FAILED — see above ***")
+
     print()
     print("=" * 72)
     print(f"  [OK] Pipeline complete in {total_elapsed/60:.1f} minutes")
