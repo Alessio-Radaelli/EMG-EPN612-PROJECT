@@ -8,18 +8,18 @@ that replaces sklearn's HalvingRandomSearchCV, adding:
   - Reusable tournament schedules across models
   - Model-aware parallelization (CPU threading vs GPU)
 
-How it works:
-  Round 0:  100 candidates × 3-fold CV on ~18K samples  → keep top 33
-  Round 1:   33 candidates × 3-fold CV on ~55K samples  → keep top 11
-  Round 2:   11 candidates × 3-fold CV on ~167K samples → keep top  4
-  Round 3:    4 candidates × 3-fold CV on ~500K samples → keep top  1
-  Round 4:    1 candidate  × 3-fold CV on ~1.5M samples → final eval
+How it works (100 candidates, factor=3, ~1.5M samples):
+  Round 0:  100 candidates × 3-fold CV on  ~55K samples → keep top 33
+  Round 1:   33 candidates × 3-fold CV on ~167K samples → keep top 11
+  Round 2:   11 candidates × 3-fold CV on ~500K samples → keep top  3
+  Round 3:    3 candidates × 3-fold CV on ~1.5M samples → winner
+  Then: train winner on full 1.5M → evaluate on held-out test set
 
 Supported models:
   xgboost  – XGBClassifier (CPU/GPU trees)
   svm      – RFF-based SVM approximation (GPU PyTorch)
   tdcnn    – Time-Delay CNN + ECA (GPU PyTorch)
-  knn      – [placeholder for future implementation]
+  knn      – ENN + CNN + KNN pipeline (CPU, imblearn)
 
 Usage:
   python scripts/hyperparam_search.py --model xgboost
@@ -59,7 +59,6 @@ TEST_DATASET_FILE = PROJECT_ROOT / "preprocessed_output" / "dataset_TEST.parquet
 MODELS_DIR    = PROJECT_ROOT / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 CHECKPOINTS_DIR = MODELS_DIR / "halving_checkpoints"
-SCHEDULE_FILE   = MODELS_DIR / "halving_tournament_schedule.json"
 
 ALL_LABELS   = sorted(["noGesture", "fist", "waveIn", "waveOut", "open", "pinch"])
 N_CLASSES    = len(ALL_LABELS)
@@ -156,15 +155,16 @@ class RFFSVMClassifier(BaseEstimator, ClassifierMixin):
     """Sklearn-compatible GPU RFF-SVM (approximate RBF kernel)."""
 
     def __init__(self, D=10000, gamma=0.01, C=5.0, lr=0.05,
-                 epochs=30, batch_size=4096):
+                 max_epochs=70, batch_size=4096, patience=10):
         self.D = D
         self.gamma = gamma
         self.C = C
         self.lr = lr
-        self.epochs = epochs
+        self.max_epochs = max_epochs
         self.batch_size = batch_size
+        self.patience = patience
 
-    def fit(self, X, y):
+    def fit(self, X, y, X_val=None, y_val=None):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.scaler_ = StandardScaler()
@@ -174,6 +174,12 @@ class RFFSVMClassifier(BaseEstimator, ClassifierMixin):
         y_enc = self.le_.fit_transform(y).astype(np.int64)
         self.classes_ = self.le_.classes_
         n_cls = len(self.classes_)
+
+        if X_val is not None:
+            X_val_sc = self.scaler_.transform(X_val).astype(np.float32)
+            y_val_enc = self.le_.transform(y_val).astype(np.int64)
+            X_val_t = torch.from_numpy(X_val_sc).to(device)
+            y_val_t = torch.from_numpy(y_val_enc).to(device)
 
         rff = RandomFourierFeatures(X.shape[1], int(self.D), float(self.gamma))
         linear = nn.Linear(int(self.D), n_cls)
@@ -187,8 +193,12 @@ class RFFSVMClassifier(BaseEstimator, ClassifierMixin):
         loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True,
                             pin_memory=(device.type == "cuda"), num_workers=0)
 
+        best_val_loss = float("inf")
+        best_state = None
+        wait = 0
+
         self.model_.train()
-        for _ in range(self.epochs):
+        for epoch in range(self.max_epochs):
             for Xb, yb in loader:
                 Xb = Xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True)
@@ -201,6 +211,35 @@ class RFFSVMClassifier(BaseEstimator, ClassifierMixin):
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
+
+            if X_val is not None:
+                self.model_.eval()
+                val_losses = []
+                with torch.no_grad():
+                    for vi in range(0, len(X_val_sc), self.batch_size):
+                        Xvb = X_val_t[vi:vi + self.batch_size]
+                        yvb = y_val_t[vi:vi + self.batch_size]
+                        vs = self.model_(Xvb)
+                        nv = vs.size(0)
+                        cv = vs[torch.arange(nv, device=device), yvb]
+                        mv = vs - cv.unsqueeze(1) + 1.0
+                        mv[torch.arange(nv, device=device), yvb] = 0.0
+                        val_losses.append(float(mv.clamp(min=0).max(dim=1)[0].sum()))
+                    val_loss = sum(val_losses) / len(X_val_sc)
+                self.model_.train()
+
+                if val_loss < best_val_loss - 1e-6:
+                    best_val_loss = val_loss
+                    best_state = {k: v.cpu().clone() for k, v in
+                                  self.model_.state_dict().items()}
+                    wait = 0
+                else:
+                    wait += 1
+                    if wait >= self.patience:
+                        break
+
+        if best_state is not None:
+            self.model_.load_state_dict(best_state)
 
         self.model_.eval()
         return self
@@ -227,13 +266,14 @@ class TDCNNSklearnWrapper(BaseEstimator, ClassifierMixin):
 
     def __init__(self, hidden_channels=(64, 128), kernel_size=3,
                  dropout=0.5, learning_rate=0.001,
-                 batch_size=32, epochs=10):
+                 batch_size=32, max_epochs=70, patience=10):
         self.hidden_channels = hidden_channels
         self.kernel_size = kernel_size
         self.dropout = dropout
         self.learning_rate = learning_rate
         self.batch_size = batch_size
-        self.epochs = epochs
+        self.max_epochs = max_epochs
+        self.patience = patience
 
     # sklearn clone() needs get_params to return the exact init values;
     # we must ensure hidden_channels stays as a tuple.
@@ -246,13 +286,19 @@ class TDCNNSklearnWrapper(BaseEstimator, ClassifierMixin):
         """(n, 72) → (n, 8, 9):  8 EMG channels × 9 TD9 features."""
         return X.reshape(-1, 8, 9).astype(np.float32)
 
-    def fit(self, X, y):
+    def fit(self, X, y, X_val=None, y_val=None):
         X_3d = self._reshape(X)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.le_ = LabelEncoder()
         y_enc = self.le_.fit_transform(y).astype(np.int64)
         self.classes_ = self.le_.classes_
+
+        if X_val is not None:
+            X_val_3d = self._reshape(X_val)
+            y_val_enc = self.le_.transform(y_val).astype(np.int64)
+            X_val_t = torch.from_numpy(X_val_3d).to(device)
+            y_val_t = torch.from_numpy(y_val_enc).to(device)
 
         hc = tuple(self.hidden_channels)
         self.model_ = _TDCNNModel(
@@ -269,8 +315,12 @@ class TDCNNSklearnWrapper(BaseEstimator, ClassifierMixin):
         loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True,
                             pin_memory=(device.type == "cuda"), num_workers=0)
 
+        best_val_loss = float("inf")
+        best_state = None
+        wait = 0
+
         self.model_.train()
-        for _ in range(self.epochs):
+        for epoch in range(self.max_epochs):
             for Xb, yb in loader:
                 Xb = Xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True)
@@ -278,6 +328,31 @@ class TDCNNSklearnWrapper(BaseEstimator, ClassifierMixin):
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
+
+            if X_val is not None:
+                self.model_.eval()
+                val_losses, val_n = 0.0, 0
+                with torch.no_grad():
+                    for vi in range(0, len(X_val_3d), self.batch_size):
+                        Xvb = X_val_t[vi:vi + self.batch_size]
+                        yvb = y_val_t[vi:vi + self.batch_size]
+                        val_losses += float(crit(self.model_(Xvb), yvb)) * len(yvb)
+                        val_n += len(yvb)
+                val_loss = val_losses / val_n
+                self.model_.train()
+
+                if val_loss < best_val_loss - 1e-6:
+                    best_val_loss = val_loss
+                    best_state = {k: v.cpu().clone() for k, v in
+                                  self.model_.state_dict().items()}
+                    wait = 0
+                else:
+                    wait += 1
+                    if wait >= self.patience:
+                        break
+
+        if best_state is not None:
+            self.model_.load_state_dict(best_state)
 
         self.model_.eval()
         return self
@@ -293,6 +368,59 @@ class TDCNNSklearnWrapper(BaseEstimator, ClassifierMixin):
                 batch = torch.from_numpy(X_3d[i:i + bs]).to(device)
                 preds.append(self.model_(batch).argmax(dim=1).cpu().numpy())
         return self.le_.inverse_transform(np.concatenate(preds))
+
+
+class ENNCNNKNNClassifier(BaseEstimator, ClassifierMixin):
+    """Sklearn-compatible ENN + CNN + KNN pipeline.
+
+    Applies Edited Nearest Neighbours (noise cleaning) then Condensed
+    Nearest Neighbour (prototype selection) during fit, producing a
+    compact reference set for KNN inference.
+
+    ENN/CNN parameters are fixed at domain-appropriate defaults;
+    only KNN hyperparameters are tuned via the halving search.
+    """
+
+    def __init__(self, n_neighbors=3, weights="uniform", metric="euclidean",
+                 enn_n_neighbors=3, enn_kind_sel="mode"):
+        self.n_neighbors = n_neighbors
+        self.weights = weights
+        self.metric = metric
+        self.enn_n_neighbors = enn_n_neighbors
+        self.enn_kind_sel = enn_kind_sel
+
+    def fit(self, X, y):
+        from imblearn.under_sampling import (
+            EditedNearestNeighbours, CondensedNearestNeighbour,
+        )
+        from sklearn.neighbors import KNeighborsClassifier
+
+        enn = EditedNearestNeighbours(
+            n_neighbors=self.enn_n_neighbors,
+            kind_sel=self.enn_kind_sel,
+        )
+        X_enn, y_enn = enn.fit_resample(X, y)
+
+        cnn = CondensedNearestNeighbour(random_state=42)
+        X_cnn, y_cnn = cnn.fit_resample(X_enn, y_enn)
+
+        self.n_prototypes_ = len(y_cnn)
+        self.X_store_ = X_cnn
+        self.y_store_ = y_cnn
+
+        self.knn_ = KNeighborsClassifier(
+            n_neighbors=min(self.n_neighbors, len(y_cnn)),
+            weights=self.weights,
+            metric=self.metric,
+            n_jobs=-1,
+        )
+        self.knn_.fit(X_cnn, y_cnn)
+        self.classes_ = self.knn_.classes_
+
+        return self
+
+    def predict(self, X):
+        return self.knn_.predict(X)
 
 
 # =============================================================================
@@ -316,6 +444,7 @@ def get_model_config(model_name, no_gpu=False):
                 pass
 
         estimator = xgb.XGBClassifier(
+            n_estimators=1000,
             objective="multi:softprob",
             eval_metric="mlogloss",
             tree_method="hist",
@@ -323,17 +452,17 @@ def get_model_config(model_name, no_gpu=False):
             random_state=42,
             n_jobs=-1,
             verbosity=0,
+            early_stopping_rounds=20,
         )
         param_dist = {
-            "n_estimators":    sp_randint(100, 600),
-            "max_depth":       sp_randint(3, 12),
+            "max_depth":       sp_randint(3, 10),
             "learning_rate":   loguniform(0.01, 0.3),
             "min_child_weight": sp_randint(1, 15),
-            "subsample":       uniform(0.6, 0.4),       # [0.6, 1.0]
-            "colsample_bytree": uniform(0.5, 0.5),      # [0.5, 1.0]
+            "subsample":       uniform(0.6, 0.4),       # [0.5, 1.0]
+            "colsample_bytree": uniform(0.6, 0.4),      # [0.5, 1.0]
             "reg_alpha":       loguniform(1e-3, 10),
             "reg_lambda":      loguniform(1e-3, 10),
-            "gamma":           uniform(0, 1),
+            "gamma":           uniform(0, 5),
         }
         return estimator, param_dist, False
 
@@ -341,10 +470,9 @@ def get_model_config(model_name, no_gpu=False):
         estimator = RFFSVMClassifier()
         param_dist = {
             "D":      [10000, 20000, 50000],
-            "gamma":  loguniform(0.001, 0.1),
+            "gamma":  loguniform(0.001, 1),
             "C":      loguniform(0.1, 100),
             "lr":     loguniform(1e-3, 0.1),
-            "epochs": [20, 30, 50],
         }
         return estimator, param_dist, True
 
@@ -353,18 +481,20 @@ def get_model_config(model_name, no_gpu=False):
         param_dist = {
             "hidden_channels": [(32, 64), (64, 128), (64, 128, 256)],
             "kernel_size":     [3, 5, 7],
-            "dropout":         uniform(0.2, 0.3),      # [0.2, 0.5]
+            "dropout":         uniform(0.2, 0.2),      # [0.2, 0.4]
             "learning_rate":   loguniform(1e-4, 1e-2),
             "batch_size":      [32, 64, 128],
-            "epochs":          [10, 20, 30],
         }
         return estimator, param_dist, True
 
     elif model_name == "knn":
-        raise NotImplementedError(
-            "KNN model not yet implemented. Add your estimator and "
-            "param_distributions to get_model_config() when ready."
-        )
+        estimator = ENNCNNKNNClassifier()
+        param_dist = {
+            "n_neighbors":  [1, 3, 5],
+            "weights":      ["uniform", "distance"],
+            "metric":       ["euclidean", "manhattan"],
+        }
+        return estimator, param_dist, False
 
     raise ValueError(f"Unknown model: {model_name}")
 
@@ -401,7 +531,22 @@ def _format_duration(seconds):
 
 
 def _sample_candidates(param_distributions, n_candidates, rng):
-    """Draw n_candidates random parameter sets from the distributions."""
+    """Draw n_candidates random parameter sets from the distributions.
+
+    If every distribution is a finite list, exhaustively enumerate all
+    combinations (ignoring n_candidates) so nothing is missed or duplicated.
+    """
+    all_lists = all(isinstance(d, list) for d in param_distributions.values())
+
+    if all_lists:
+        from itertools import product
+        names = list(param_distributions.keys())
+        combos = list(product(*(param_distributions[n] for n in names)))
+        rng.shuffle(combos)
+        candidates = [{n: _json_safe(v) for n, v in zip(names, combo)}
+                      for combo in combos]
+        return candidates
+
     candidates = []
     for _ in range(n_candidates):
         params = {}
@@ -452,11 +597,25 @@ def _evaluate_candidate(estimator, params, X, y, groups, cv):
     est = clone(estimator)
     est.set_params(**params)
 
+    try:
+        import xgboost as xgb
+        is_xgb = isinstance(est, xgb.XGBClassifier)
+    except ImportError:
+        is_xgb = False
+    has_val = isinstance(est, (RFFSVMClassifier, TDCNNSklearnWrapper))
+
     scores = []
     for train_idx, val_idx in cv.split(X, y, groups):
         X_tr, y_tr = X[train_idx], y[train_idx]
         X_va, y_va = X[val_idx], y[val_idx]
-        est.fit(X_tr, y_tr)
+
+        if is_xgb:
+            est.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+        elif has_val:
+            est.fit(X_tr, y_tr, X_val=X_va, y_val=y_va)
+        else:
+            est.fit(X_tr, y_tr)
+
         y_pred = est.predict(X_va)
         scores.append(float(accuracy_score(y_va, y_pred)))
 
@@ -473,14 +632,15 @@ def compute_schedule(n_total, n_candidates, factor):
     Returns list of dicts: [{round, n_candidates, n_samples}, ...]
     """
     # Number of elimination rounds needed to reach 1 survivor
-    n_rounds_by_cand = int(np.ceil(np.log(n_candidates) / np.log(factor)))
-    # +1 for a final full-data evaluation of the winner
-    n_rounds = n_rounds_by_cand + 1
+    c, n_rounds = n_candidates, 0
+    while c > 1:
+        c = max(1, int(c / factor))
+        n_rounds += 1
 
     # min_resources: back-calculate so the last round uses all data
     min_resources = max(
         N_CLASSES * 10,  # absolute minimum for stratified splits
-        int(n_total / (factor ** n_rounds_by_cand)),
+        int(n_total / (factor ** (n_rounds - 1))),
     )
 
     schedule = []
@@ -498,8 +658,14 @@ def compute_schedule(n_total, n_candidates, factor):
 
 
 def load_or_create_schedule(n_total, n_candidates, factor, n_splits,
-                            random_state):
-    """Load saved schedule or create + save a new one."""
+                            random_state, model_name="default"):
+    """Load saved schedule or create + save a new one.
+
+    Each model gets its own schedule file so models with different candidate
+    counts (e.g. KNN with an exhaustive grid) don't conflict.
+    """
+    schedule_file = MODELS_DIR / f"halving_schedule_{model_name}.json"
+
     meta = {
         "dataset_rows": n_total,
         "n_candidates": n_candidates,
@@ -508,9 +674,8 @@ def load_or_create_schedule(n_total, n_candidates, factor, n_splits,
         "random_state": random_state,
     }
 
-    if SCHEDULE_FILE.exists():
-        saved = json.loads(SCHEDULE_FILE.read_text())
-        # Check compatibility
+    if schedule_file.exists():
+        saved = json.loads(schedule_file.read_text())
         compat = True
         for key in ("dataset_rows", "n_candidates", "factor",
                      "n_splits", "random_state"):
@@ -518,7 +683,7 @@ def load_or_create_schedule(n_total, n_candidates, factor, n_splits,
                 compat = False
                 break
         if compat:
-            print(f"  Loaded existing tournament schedule from {SCHEDULE_FILE.name}")
+            print(f"  Loaded existing tournament schedule from {schedule_file.name}")
             return saved["rounds"]
         else:
             print(f"  WARNING: schedule parameters changed — regenerating.")
@@ -527,8 +692,8 @@ def load_or_create_schedule(n_total, n_candidates, factor, n_splits,
 
     rounds = compute_schedule(n_total, n_candidates, factor)
     saved = {**meta, "rounds": rounds}
-    SCHEDULE_FILE.write_text(json.dumps(saved, indent=2))
-    print(f"  Saved tournament schedule to {SCHEDULE_FILE.name}")
+    schedule_file.write_text(json.dumps(saved, indent=2))
+    print(f"  Saved tournament schedule to {schedule_file.name}")
     return rounds
 
 
@@ -543,16 +708,6 @@ def run_halving(model_name, estimator, param_distributions, X, y, groups,
     n_total = len(y)
     rng = np.random.RandomState(random_state)
 
-    # --- Schedule --------------------------------------------------------
-    rounds = load_or_create_schedule(
-        n_total, n_candidates, factor, n_splits, random_state)
-    n_rounds = len(rounds)
-
-    print(f"\n  Tournament: {n_rounds} rounds, factor={factor}")
-    for r in rounds:
-        print(f"    Round {r['round']}: {r['n_candidates']:3d} candidates "
-              f"× {r['n_samples']:>10,} samples")
-
     # --- Checkpoint directory -------------------------------------------
     cp_dir = CHECKPOINTS_DIR / model_name
     cp_dir.mkdir(parents=True, exist_ok=True)
@@ -566,6 +721,19 @@ def run_halving(model_name, estimator, param_distributions, X, y, groups,
         candidates = _sample_candidates(param_distributions, n_candidates, rng)
         cand_file.write_text(json.dumps(candidates, indent=2, default=str))
         print(f"\n  Sampled {len(candidates)} initial candidates")
+
+    actual_n_candidates = len(candidates)
+
+    # --- Schedule (based on actual candidate count) ---------------------
+    rounds = load_or_create_schedule(
+        n_total, actual_n_candidates, factor, n_splits, random_state,
+        model_name=model_name)
+    n_rounds = len(rounds)
+
+    print(f"\n  Tournament: {n_rounds} rounds, factor={factor}")
+    for r in rounds:
+        print(f"    Round {r['round']}: {r['n_candidates']:3d} candidates "
+              f"× {r['n_samples']:>10,} samples")
 
     # --- Resume: find last completed round ------------------------------
     start_round = 0
@@ -710,11 +878,17 @@ def run_halving(model_name, estimator, param_distributions, X, y, groups,
     # Save full results CSV
     _save_results_csv(model_name, cp_dir, n_rounds)
 
-    # Train final model with best params on full data
+    # Train final model with best params on full data (no early stopping)
     print(f"\n  Training final model with best params on full data ...")
     t0 = time.time()
     final_est = clone(estimator)
     final_est.set_params(**best_params)
+    try:
+        import xgboost as xgb
+        if isinstance(final_est, xgb.XGBClassifier):
+            final_est.set_params(early_stopping_rounds=None)
+    except ImportError:
+        pass
     final_est.fit(X, y)
     print(f"  Final model trained ({time.time()-t0:.1f}s)")
 
@@ -775,6 +949,20 @@ def _save_final_model(estimator, model_name):
             "params": estimator.get_params(),
         }, path)
         print(f"  Model saved: {path}")
+
+    elif model_name == "knn":
+        import joblib
+        path = MODELS_DIR / f"{model_name}_best_halving.joblib"
+        joblib.dump({
+            "knn": estimator.knn_,
+            "X_store": estimator.X_store_,
+            "y_store": estimator.y_store_,
+            "n_prototypes": estimator.n_prototypes_,
+            "params": estimator.get_params(),
+        }, path)
+        print(f"  Model saved: {path}")
+        print(f"  Prototypes: {estimator.n_prototypes_:,} "
+              f"(condensed from full training set)")
 
 
 def _evaluate_on_test_set(estimator, model_name):
@@ -905,7 +1093,7 @@ def main():
 
     # Which models to search
     if args.model == "all":
-        models = ["xgboost", "svm", "tdcnn"]
+        models = ["xgboost", "svm", "tdcnn", "knn"]
     else:
         models = [args.model]
 
