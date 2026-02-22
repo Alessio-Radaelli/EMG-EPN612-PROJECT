@@ -61,7 +61,7 @@ N_CLASSES    = len(ALL_LABELS)
 CHANNELS     = [f"ch{i}" for i in range(1, 9)]
 TD9_NAMES    = ["LS", "MFL", "MSR", "WAMP", "ZC", "RMS", "IAV", "DASDV", "VAR"]
 ALL_FEATURE_COLS = [f"{ch}_{feat}" for ch in CHANNELS for feat in TD9_NAMES]
-META_COLS    = {"label", "user", "repetition", "gesture"}
+META_COLS    = {"label", "user", "sample_id", "window_idx"}
 
 DATASET_FILES = {
     72: ("dataset_TRAINING.parquet",            "dataset_TEST.parquet"),
@@ -1047,7 +1047,7 @@ def load_data(n_features):
     df = pd.read_parquet(dataset_file)
     print(f"  {len(df):,} rows × {len(df.columns)} cols  ({time.time()-t0:.1f}s)")
 
-    FEATURE_COLS = [c for c in df.columns if c not in META_COLS]
+    FEATURE_COLS = [c for c in df.columns if c in ALL_FEATURE_COLS]
     N_FEATURES = len(FEATURE_COLS)
     X = df[FEATURE_COLS].values.astype(np.float32)
 
