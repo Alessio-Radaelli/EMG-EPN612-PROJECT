@@ -13,14 +13,15 @@ Methods:
   5. Recursive Feature Elimination — RFE with LinearSVC estimator
 
 Outputs:
-  • Console summary of per-method and consensus rankings.
-  • models/feature_ranking.csv  — full ranking table (72 rows).
-  • (optional) reduced-feature parquet copies of both datasets.
+  • Console summary comparing rank-based and score-based consensus.
+  • models/feature_ranking_ranks.csv  — rank-based (Borda count) ranking.
+  • models/feature_ranking_scores.csv — score-based (min-max norm) ranking.
+  • preprocessed_output/dataset_TRAINING_reduced{36,18}.parquet (default on).
 
 Usage:
     cd "EMG-EPN612 project"
     python scripts/feature_selection.py
-    python scripts/feature_selection.py --top-k 36 --save-reduced
+    python scripts/feature_selection.py --top-k 36 --no-save-reduced
     python scripts/feature_selection.py --n-folds 10 --top-k 24
 """
 
@@ -44,7 +45,6 @@ from sklearn.svm import LinearSVC
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import accuracy_score
 import xgboost as xgb
-import joblib
 
 # --- Project paths -----------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -326,12 +326,11 @@ def run_cv_feature_selection(X, y, groups, n_folds=5, corr_thr=0.95,
 # Consensus Ranking
 # =============================================================================
 
-def build_ranking_table(avg_scores: dict, feature_cols: list):
-    """Build a DataFrame with per-method normalised scores and consensus rank.
+def build_score_ranking(avg_scores: dict, feature_cols: list):
+    """Consensus via min-max normalised scores (original method).
 
-    Returns
-    -------
-    df_rank : pd.DataFrame  (72 rows, sorted by consensus_score descending)
+    Each method's raw scores are normalised to [0, 1], then averaged.
+    Higher consensus_score = more important.
     """
     df = pd.DataFrame({"feature": feature_cols})
 
@@ -343,9 +342,32 @@ def build_ranking_table(avg_scores: dict, feature_cols: list):
         df[col_norm] = _normalise_scores(raw_scores)
         norm_cols.append(col_norm)
 
-    # Consensus = mean of normalised scores
     df["consensus_score"] = df[norm_cols].mean(axis=1)
     df = df.sort_values("consensus_score", ascending=False).reset_index(drop=True)
+    df.insert(0, "rank", range(1, len(df) + 1))
+
+    return df
+
+
+def build_rank_voting(avg_scores: dict, feature_cols: list):
+    """Consensus via rank-based voting (Borda count).
+
+    Each method's raw scores are converted to per-method ranks (1 = best),
+    then averaged.  Lower avg_rank = more important.  Immune to outliers
+    and scale differences between methods.
+    """
+    df = pd.DataFrame({"feature": feature_cols})
+
+    rank_cols = []
+    for method, raw_scores in avg_scores.items():
+        col_raw = f"{method}_raw"
+        col_mrank = f"{method}_mrank"
+        df[col_raw] = raw_scores
+        df[col_mrank] = df[col_raw].rank(ascending=False, method="min").astype(int)
+        rank_cols.append(col_mrank)
+
+    df["avg_rank"] = df[rank_cols].mean(axis=1)
+    df = df.sort_values("avg_rank", ascending=True).reset_index(drop=True)
     df.insert(0, "rank", range(1, len(df) + 1))
 
     return df
@@ -355,46 +377,41 @@ def build_ranking_table(avg_scores: dict, feature_cols: list):
 # Quick Validation (top-K vs full features)
 # =============================================================================
 
-def quick_validation(X, y, groups, top_features: list, n_folds: int = 5):
-    """Compare XGBoost accuracy with all 72 features vs top-K subset,
-    using the same GroupKFold splits for a fair comparison.
+def quick_validation(X, y, groups, feature_sets, n_folds=5):
+    """Compare XGBoost accuracy across multiple feature subsets using the
+    same GroupKFold splits for a fair comparison.
+
+    Parameters
+    ----------
+    feature_sets : list of (label, feature_name_list) tuples
+    n_folds      : int
+
+    Returns
+    -------
+    results : list of (label, n_features, mean_acc, std_acc)
     """
-    top_idx = [FEATURE_COLS.index(f) for f in top_features]
     gkf = GroupKFold(n_splits=n_folds)
+    splits = list(gkf.split(X, y, groups))
 
-    acc_full = []
-    acc_topk = []
+    results = []
+    for label, feats in feature_sets:
+        fidx = [FEATURE_COLS.index(f) for f in feats]
+        accs = []
+        for train_idx, val_idx in splits:
+            clf = xgb.XGBClassifier(
+                n_estimators=100, max_depth=4, learning_rate=0.1,
+                subsample=0.8, colsample_bytree=0.8,
+                objective="multi:softprob", num_class=N_CLASSES,
+                eval_metric="mlogloss", tree_method="hist",
+                random_state=42, n_jobs=-1, verbosity=0,
+            )
+            clf.fit(X[train_idx][:, fidx], y[train_idx])
+            accs.append(accuracy_score(y[val_idx], clf.predict(X[val_idx][:, fidx])))
+            del clf
+            gc.collect()
+        results.append((label, len(feats), np.mean(accs), np.std(accs)))
 
-    for fold_idx, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups)):
-        X_tr, y_tr = X[train_idx], y[train_idx]
-        X_va, y_va = X[val_idx],   y[val_idx]
-
-        # Full features
-        clf_full = xgb.XGBClassifier(
-            n_estimators=100, max_depth=4, learning_rate=0.1,
-            subsample=0.8, colsample_bytree=0.8,
-            objective="multi:softprob", num_class=N_CLASSES,
-            eval_metric="mlogloss", tree_method="hist",
-            random_state=42, n_jobs=-1, verbosity=0,
-        )
-        clf_full.fit(X_tr, y_tr)
-        acc_full.append(accuracy_score(y_va, clf_full.predict(X_va)))
-
-        # Top-K features only
-        clf_topk = xgb.XGBClassifier(
-            n_estimators=100, max_depth=4, learning_rate=0.1,
-            subsample=0.8, colsample_bytree=0.8,
-            objective="multi:softprob", num_class=N_CLASSES,
-            eval_metric="mlogloss", tree_method="hist",
-            random_state=42, n_jobs=-1, verbosity=0,
-        )
-        clf_topk.fit(X_tr[:, top_idx], y_tr)
-        acc_topk.append(accuracy_score(y_va, clf_topk.predict(X_va[:, top_idx])))
-
-        del clf_full, clf_topk
-        gc.collect()
-
-    return np.mean(acc_full), np.std(acc_full), np.mean(acc_topk), np.std(acc_topk)
+    return results
 
 
 # =============================================================================
@@ -436,19 +453,20 @@ def main(args):
     gc.collect()
 
     # -- 3. Feature ranking (compute or load from CSV) -------------------------
-    csv_path = MODELS_DIR / "feature_ranking.csv"
+    csv_ranks  = MODELS_DIR / "feature_ranking_ranks.csv"
+    csv_scores = MODELS_DIR / "feature_ranking_scores.csv"
 
     if args.from_csv:
-        # ---- Load pre-computed ranking from CSV ------------------------------
-        if not csv_path.exists():
-            print(f"ERROR: {csv_path} not found. Run without --from-csv first.",
-                  file=sys.stderr)
+        missing = [p for p in (csv_ranks, csv_scores) if not p.exists()]
+        if missing:
+            print(f"ERROR: missing {[p.name for p in missing]}. "
+                  f"Run without --from-csv first.", file=sys.stderr)
             sys.exit(1)
-        print(f"\n  Loading pre-computed ranking from {csv_path.name} ...")
-        df_rank = pd.read_csv(csv_path)
-        print(f"  {len(df_rank)} features loaded  (skipping CV scoring)")
+        print(f"\n  Loading pre-computed rankings ...")
+        df_rnk = pd.read_csv(csv_ranks)
+        df_scr = pd.read_csv(csv_scores)
+        print(f"  {len(df_rnk)} features loaded  (skipping CV scoring)")
     else:
-        # ---- Run full cross-validated feature selection -----------------------
         print(f"\n{'─'*70}")
         print("  Running cross-validated feature selection ...")
         print(f"{'─'*70}")
@@ -460,93 +478,102 @@ def main(args):
             subsample=args.subsample,
         )
 
-        # -- Build ranking table -----------------------------------------------
         print(f"\n{'─'*70}")
-        print("  Building consensus ranking ...")
+        print("  Building consensus rankings (rank-based + score-based) ...")
         print(f"{'─'*70}")
 
-        df_rank = build_ranking_table(avg_scores, FEATURE_COLS)
+        df_rnk = build_rank_voting(avg_scores, FEATURE_COLS)
+        df_scr = build_score_ranking(avg_scores, FEATURE_COLS)
 
-        # Save CSV
-        df_rank.to_csv(csv_path, index=False, float_format="%.6f")
-        print(f"\n  Saved: {csv_path}")
+        df_rnk.to_csv(csv_ranks,  index=False, float_format="%.6f")
+        df_scr.to_csv(csv_scores, index=False, float_format="%.6f")
+        print(f"  Saved: {csv_ranks.name}")
+        print(f"  Saved: {csv_scores.name}")
 
-    # Print top-K
+    # -- 4. Print rank-based table (primary) -----------------------------------
     top_k = min(args.top_k, N_FEATURES)
-    print(f"\n  Top {top_k} features (consensus ranking):\n")
-    print(f"  {'Rank':>4s}  {'Feature':<15s}  "
+
+    print(f"\n{'─'*70}")
+    print(f"  RANK-BASED consensus (Borda count)  —  top {top_k}")
+    print(f"{'─'*70}\n")
+    print(f"  {'Rk':>4s}  {'Feature':<15s}  "
+          f"{'Corr':>5s}  {'ANOVA':>5s}  {'MI':>5s}  "
+          f"{'XGB':>5s}  {'RFE':>5s}  {'AvgRk':>6s}")
+    print(f"  {'─'*4}  {'─'*15}  " + "  ".join(["─"*5]*5) + f"  {'─'*6}")
+    for _, row in df_rnk.head(top_k).iterrows():
+        print(f"  {int(row['rank']):4d}  {row['feature']:<15s}  "
+              f"{int(row['corr_filter_mrank']):5d}  "
+              f"{int(row['anova_f_mrank']):5d}  "
+              f"{int(row['mutual_info_mrank']):5d}  "
+              f"{int(row['xgb_gain_mrank']):5d}  "
+              f"{int(row['rfe_rank_mrank']):5d}  "
+              f"{row['avg_rank']:6.1f}")
+
+    print(f"\n{'─'*70}")
+    print(f"  SCORE-BASED consensus (min-max norm)  —  top {top_k}")
+    print(f"{'─'*70}\n")
+    print(f"  {'Rk':>4s}  {'Feature':<15s}  "
           f"{'Corr':>6s}  {'ANOVA':>6s}  {'MI':>6s}  "
           f"{'XGB':>6s}  {'RFE':>6s}  {'Score':>6s}")
     print(f"  {'─'*4}  {'─'*15}  " + "  ".join(["─"*6]*6))
-    for _, row in df_rank.head(top_k).iterrows():
+    for _, row in df_scr.head(top_k).iterrows():
         print(f"  {int(row['rank']):4d}  {row['feature']:<15s}  "
               f"{row['corr_filter_norm']:6.3f}  {row['anova_f_norm']:6.3f}  "
               f"{row['mutual_info_norm']:6.3f}  {row['xgb_gain_norm']:6.3f}  "
               f"{row['rfe_rank_norm']:6.3f}  {row['consensus_score']:6.3f}")
 
-    # Bottom-5 (least important)
-    print(f"\n  Bottom 5 features:")
-    for _, row in df_rank.tail(5).iterrows():
-        print(f"  {int(row['rank']):4d}  {row['feature']:<15s}  "
-              f"score={row['consensus_score']:.3f}")
+    # -- 4b. Comparison --------------------------------------------------------
+    for k in (36, 18):
+        rnk_set = set(df_rnk.head(k)["feature"])
+        scr_set = set(df_scr.head(k)["feature"])
+        only_rnk = sorted(rnk_set - scr_set)
+        only_scr = sorted(scr_set - rnk_set)
+        if not only_rnk and not only_scr:
+            print(f"\n  Top-{k}: both methods agree on the same features.")
+        else:
+            print(f"\n  Top-{k}: {len(only_rnk)} feature(s) differ")
+            if only_rnk:
+                print(f"    Rank-only : {', '.join(only_rnk)}")
+            if only_scr:
+                print(f"    Score-only: {', '.join(only_scr)}")
 
-    # -- 5. Quick validation ---------------------------------------------------
+    # -- 5. Quick validation (using rank-based as primary) ---------------------
     print(f"\n{'─'*70}")
-    print(f"  Quick Validation: top-{top_k} vs all {N_FEATURES} features")
-    print(f"  ({args.n_folds}-fold cross-validated XGBoost)")
+    print(f"  Quick Validation: XGBoost accuracy (rank-based feature sets)")
+    print(f"  ({args.n_folds}-fold GroupKFold)")
     print(f"{'─'*70}")
 
-    top_features = df_rank.head(top_k)["feature"].tolist()
+    feature_sets = [
+        ("All 72", FEATURE_COLS),
+        ("Top 36", df_rnk.head(36)["feature"].tolist()),
+        ("Top 18", df_rnk.head(18)["feature"].tolist()),
+    ]
     t0 = time.time()
-    acc_full_m, acc_full_s, acc_topk_m, acc_topk_s = quick_validation(
-        X, y, groups, top_features, n_folds=args.n_folds,
-    )
-    print(f"\n  All {N_FEATURES} features : {acc_full_m:.4f} ± {acc_full_s:.4f}")
-    print(f"  Top {top_k:>2d} features  : {acc_topk_m:.4f} ± {acc_topk_s:.4f}")
-    delta = acc_topk_m - acc_full_m
-    sign = "+" if delta >= 0 else ""
-    print(f"  Δ accuracy       : {sign}{delta:.4f}")
+    results = quick_validation(X, y, groups, feature_sets, n_folds=args.n_folds)
+    for label, n_feat, mean_acc, std_acc in results:
+        print(f"  {label:<8s} ({n_feat:>2d} feat) : {mean_acc:.4f} ± {std_acc:.4f}")
     print(f"  ({_format_duration(time.time()-t0)})")
 
-    # -- 6. Optionally save reduced datasets -----------------------------------
+    # -- 6. Save reduced datasets (using rank-based) ---------------------------
     if args.save_reduced:
         print(f"\n{'─'*70}")
-        print(f"  Saving reduced-feature datasets (top {top_k}) ...")
+        print(f"  Saving reduced-feature datasets (rank-based selection) ...")
         print(f"{'─'*70}")
 
         meta_cols = ["label", "user", "sample_id", "window_idx"]
-        keep_cols = top_features + meta_cols
 
-        # Save reduced dataset with top 36 features
         if SVM_FILE.exists():
             t0 = time.time()
             df_src = pd.read_parquet(SVM_FILE)
-            missing = [c for c in keep_cols if c not in df_src.columns]
-            if missing:
-                print(f"  WARNING: TRAINING missing columns: {missing}")
-                keep_cols_actual = [c for c in keep_cols if c in df_src.columns]
-            else:
-                keep_cols_actual = keep_cols
 
-            out_path_36 = SVM_FILE.parent / "dataset_TRAINING_reduced36.parquet"
-            df_src[keep_cols_actual].to_parquet(out_path_36, index=False)
-            print(f"  → {out_path_36.name}  ({len(df_src):,} rows × "
-                  f"{len(keep_cols_actual)} cols)  ({time.time()-t0:.1f}s)")
+            for topk, suffix in [(36, "reduced36"), (18, "reduced18")]:
+                top_feats = df_rnk.head(topk)["feature"].tolist()
+                keep = [c for c in top_feats + meta_cols if c in df_src.columns]
+                out = SVM_FILE.parent / f"dataset_TRAINING_{suffix}.parquet"
+                df_src[keep].to_parquet(out, index=False)
+                print(f"  → {out.name}  ({len(df_src):,} rows × "
+                      f"{len(keep)} cols)  ({time.time()-t0:.1f}s)")
 
-            # Save reduced dataset with top 18 features
-            top_18_features = df_rank.head(18)["feature"].tolist()
-            keep_cols_18 = top_18_features + meta_cols
-            missing_18 = [c for c in keep_cols_18 if c not in df_src.columns]
-            if missing_18:
-                print(f"  WARNING: TRAINING missing columns for top 18: {missing_18}")
-                keep_cols_actual_18 = [c for c in keep_cols_18 if c in df_src.columns]
-            else:
-                keep_cols_actual_18 = keep_cols_18
-
-            out_path_18 = SVM_FILE.parent / "dataset_TRAINING_reduced18.parquet"
-            df_src[keep_cols_actual_18].to_parquet(out_path_18, index=False)
-            print(f"  → {out_path_18.name}  ({len(df_src):,} rows × "
-                  f"{len(keep_cols_actual_18)} cols)  ({time.time()-t0:.1f}s)")
             del df_src
             gc.collect()
         else:
@@ -556,9 +583,10 @@ def main(args):
     total = time.time() - t_start
     print(f"\n{'='*70}")
     print(f"  ✓ Feature selection complete in {_format_duration(total)}")
-    print(f"  Ranking saved to: {csv_path}")
+    print(f"  Rank-based  : {csv_ranks}")
+    print(f"  Score-based : {csv_scores}")
     if args.save_reduced:
-        print(f"  Reduced datasets saved to: {SVM_FILE.parent}")
+        print(f"  Reduced sets: {SVM_FILE.parent}")
     print(f"{'='*70}")
 
 
@@ -584,8 +612,10 @@ def parse_args():
     p.add_argument("--subsample", type=int, default=DEFAULT_SUBSAMPLE,
                    help="Max training rows for slow methods (MI, RFE). "
                         "0 = use all rows (slower).")
-    p.add_argument("--save-reduced", action="store_true",
-                   help="Save reduced-feature copies of both parquet files.")
+    p.add_argument("--no-save-reduced", dest="save_reduced",
+                   action="store_false",
+                   help="Skip saving reduced-feature parquet files.")
+    p.set_defaults(save_reduced=True)
     return p.parse_args()
 
 

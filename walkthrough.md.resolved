@@ -1,0 +1,54 @@
+# Walkthrough: Successive Halving Hyperparameter Search
+
+## What was built
+
+[hyperparam_search.py](file:///c:/Users/aless/Documents/EMG-EPN612%20project/scripts/hyperparam_search.py) — a unified script (~870 lines) implementing the successive halving tournament for hyperparameter optimization.
+
+### Key components
+
+| Component | Description |
+|-----------|-------------|
+| **Manual successive halving** | Tournament-style elimination: starts with many candidates on small data, progressively eliminates the worst while increasing data size |
+| **[RFFSVMClassifier](file:///c:/Users/aless/Documents/EMG-EPN612%20project/scripts/hyperparam_search.py#154-218)** | sklearn-compatible wrapper for your GPU RFF-SVM |
+| **[TDCNNSklearnWrapper](file:///c:/Users/aless/Documents/EMG-EPN612%20project/scripts/hyperparam_search.py#220-295)** | sklearn-compatible wrapper for your TDCNN+ECA model (reshapes 72 TD9 features → 8×9 for Conv1d) |
+| **`StratifiedGroupKFold`** | Dual stratification: patient-level grouping + class-balanced folds |
+| **Per-round checkpoints** | Each round saves to `models/halving_checkpoints/{model}/round_N.json` — crash at round 4/7 only loses round 4 |
+| **Tournament schedule** | Saved to [models/halving_tournament_schedule.json](file:///c:/Users/aless/Documents/EMG-EPN612%20project/models/halving_tournament_schedule.json) — reusable across models for identical data splits |
+| **`--resume` flag** | Scans for checkpoints, skips completed rounds |
+
+### Usage
+
+```bash
+# Run search for one model
+python scripts/hyperparam_search.py --model xgboost
+python scripts/hyperparam_search.py --model svm
+python scripts/hyperparam_search.py --model tdcnn
+
+# Resume an interrupted run
+python scripts/hyperparam_search.py --model xgboost --resume
+
+# Customize the tournament
+python scripts/hyperparam_search.py --model xgboost --n-candidates 50 --factor 2
+
+# Run all models
+python scripts/hyperparam_search.py --model all
+```
+
+## Verification
+
+Ran a dry test with `--n-candidates 4 --factor 2` on XGBoost:
+
+- **Round 0**: 4 candidates × 386K samples × 3-fold CV → eliminated 2
+- **Round 1**: 2 candidates × 770K samples × 3-fold CV → eliminated 1
+- **Round 2**: 1 candidate × 1.5M samples × 3-fold CV → final evaluation
+- **Final model** trained on full 1.5M dataset and saved
+
+All output artifacts produced:
+- [models/halving_tournament_schedule.json](file:///c:/Users/aless/Documents/EMG-EPN612%20project/models/halving_tournament_schedule.json) — tournament schedule
+- `models/halving_checkpoints/xgboost/round_*.json` — per-round checkpoints
+- [models/xgboost_best_params.json](file:///c:/Users/aless/Documents/EMG-EPN612%20project/models/xgboost_best_params.json) — best hyperparameters
+- [models/xgboost_halving_results.csv](file:///c:/Users/aless/Documents/EMG-EPN612%20project/models/xgboost_halving_results.csv) — all candidates with scores
+- [models/xgboost_best_halving.json](file:///c:/Users/aless/Documents/EMG-EPN612%20project/models/xgboost_best_halving.json) — trained final model
+
+### Bug fixed during testing
+XGBoost raised `ValueError: Invalid classes inferred from unique values` when string labels were used with `num_class` set. Fixed by pre-encoding labels to integers in [load_data()](file:///c:/Users/aless/Documents/EMG-EPN612%20project/scripts/hyperparam_search.py#767-800) and removing `num_class` (auto-detected).

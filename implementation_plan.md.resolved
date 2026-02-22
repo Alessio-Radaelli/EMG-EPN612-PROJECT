@@ -1,0 +1,125 @@
+# Unified Hyperparameter Search with Successive Halving
+
+Build a single script `scripts/hyperparam_search.py` that runs successive halving for each model, with stratification, parallelization, reusable tournament schedules, and **per-round checkpointing with resume**.
+
+> [!IMPORTANT]
+> **Why not `HalvingRandomSearchCV`?** It runs as a single [fit()](file:///c:/Users/aless/Documents/EMG-EPN612%20project/scripts/tdcnn_eca.py#166-212) call with no intermediate saving. If interrupted, all progress is lost. Instead, we implement the same algorithm manually with per-round checkpoints, so a crash or `Ctrl+C` at round 4/7 loses only that round.
+
+---
+
+## Core Design
+
+### 1. Stratification: `StratifiedGroupKFold`
+- **Per-user grouping** — all windows from one patient stay in the same fold
+- **Per-class stratification** — each fold has ~equal gesture class proportions
+
+### 2. Tournament schedule: saved & reusable
+- First run computes fold assignments + per-round subsample indices → `models/halving_tournament_schedule.json`
+- Later runs (e.g., KNN) load the same file → identical data splits
+- Mismatch detection: dataset size, seed, n_candidates, factor stored alongside
+
+### 3. Parallelization: model-aware
+
+| Model | Outer `n_jobs` | Inner parallelism |
+|-------|:-:|---|
+| **XGBoost** | `-1` (all CPUs) | `n_jobs=1` per candidate |
+| **SVM-RFF** | `1` | GPU (CUDA) |
+| **TDCNN-ECA** | `1` | GPU (CUDA) |
+| **KNN** *(future)* | `-1` (all CPUs) | Single-threaded |
+
+### 4. Per-round checkpointing & resume
+
+Each halving round saves its results immediately:
+
+```
+models/halving_checkpoints/{model}/
+  ├── round_0.json    ← candidates + scores for round 0
+  ├── round_1.json    ← survivors + scores for round 1
+  ├── ...
+  └── final_results.json
+```
+
+On `--resume`, the script:
+1. Scans for existing `round_*.json` files
+2. Loads the last completed round's survivors
+3. Continues from the next round
+
+---
+
+## The Successive Halving Algorithm (Manual)
+
+```
+Round 0:  100 candidates × 3-fold CV on   ~1,000 samples  → keep top 33
+Round 1:   33 candidates × 3-fold CV on   ~3,000 samples  → keep top 11
+Round 2:   11 candidates × 3-fold CV on   ~9,000 samples  → keep top  4
+Round 3:    4 candidates × 3-fold CV on  ~27,000 samples  → keep top  1
+  └─ WINNER (best hyperparameters)
+```
+
+Each round:
+1. Subsample `n_samples_k = min_resources × factor^k` — using saved indices
+2. Evaluate surviving candidates via `cross_val_score(cv=StratifiedGroupKFold, groups=...)`
+3. Rank by mean CV accuracy
+4. **Save round checkpoint** (all scores + surviving candidate params)
+5. Eliminate bottom [(1 - 1/factor)](file:///c:/Users/aless/Documents/EMG-EPN612%20project/scripts/tdcnn_eca.py#16-37) candidates
+
+---
+
+## Proposed Changes
+
+### [NEW] [hyperparam_search.py](file:///c:/Users/aless/Documents/EMG-EPN612%20project/scripts/hyperparam_search.py)
+
+#### A. Sklearn wrappers
+- `RFFSVMClassifier` — wraps PyTorch RFF+Linear with hinge loss
+- `TDCNNSklearnWrapper` — proxies to [TDCNNClassifier](file:///c:/Users/aless/Documents/EMG-EPN612%20project/scripts/tdcnn_eca.py#93-298), adds sklearn API
+- XGBoost — `XGBClassifier` directly
+- KNN — placeholder stub
+
+#### B. Param distributions
+
+| Model | Hyperparameters | 
+|-------|----------------|
+| **XGBoost** | `max_depth`, `learning_rate`, `min_child_weight`, [subsample](file:///c:/Users/aless/Documents/EMG-EPN612%20project/scripts/train_dtw_knn.py#234-259), `colsample_bytree`, `reg_alpha`, `reg_lambda`, `gamma` |
+| **SVM-RFF** | `D`, `gamma`, `C`, `lr`, `epochs` |
+| **TDCNN-ECA** | `hidden_channels`, `kernel_size`, `dropout`, `learning_rate`, `batch_size`, `epochs` |
+| **KNN** | `n_neighbors`, [weights](file:///c:/Users/aless/Documents/EMG-EPN612%20project/scripts/train_xgboost.py#87-97), `metric` |
+
+*(Full distributions: randint, loguniform, uniform — same as before)*
+
+#### C. CLI
+
+```bash
+python scripts/hyperparam_search.py --model xgboost
+python scripts/hyperparam_search.py --model svm --resume          # resume interrupted run
+python scripts/hyperparam_search.py --model tdcnn --n-candidates 50
+python scripts/hyperparam_search.py --model all
+```
+
+Options: `--n-candidates 100`, `--factor 3`, `--n-splits 3`, `--no-gpu`, `--scoring accuracy`, `--resume`
+
+#### D. Output
+
+| File | Contents |
+|------|----------|
+| `models/halving_tournament_schedule.json` | Fold indices + per-round subsamples |
+| `models/halving_checkpoints/{model}/round_N.json` | Per-round checkpoint (crash-safe) |
+| `models/{model}_halving_results.csv` | All candidates with per-round scores |
+| `models/{model}_best_params.json` | Best hyperparameters |
+| `models/{model}_best_model.*` | Saved best model |
+
+---
+
+## Verification Plan
+
+### Quick validation
+```bash
+python scripts/hyperparam_search.py --model xgboost --n-candidates 4 --factor 2
+```
+
+### Resume test
+```bash
+# Run, then Ctrl+C mid-search:
+python scripts/hyperparam_search.py --model xgboost --n-candidates 8 --factor 2
+# Resume — should skip completed rounds:
+python scripts/hyperparam_search.py --model xgboost --n-candidates 8 --factor 2 --resume
+```
