@@ -18,14 +18,14 @@ How it works (100 candidates, factor=3, ~1.5M samples):
 Supported models:
   xgboost  – XGBClassifier (CPU/GPU trees)
   svm      – RFF-based SVM approximation (GPU PyTorch)
-  tdcnn    – Time-Delay CNN + ECA (GPU PyTorch)
   knn      – ENN + CNN + KNN pipeline (CPU, imblearn)
 
 Usage:
   python scripts/hyperparam_search.py --model xgboost
-  python scripts/hyperparam_search.py --model xgboost --no-resume   # discard checkpoints
-  python scripts/hyperparam_search.py --model xgboost --n-candidates 50 --factor 2
+  python scripts/hyperparam_search.py --model xgboost --features 36   # top-36 features
+  python scripts/hyperparam_search.py --model xgboost --no-resume     # discard checkpoints
   python scripts/hyperparam_search.py --model all
+  python scripts/hyperparam_search.py --model all --features 18       # top-18 features
 """
 
 import sys
@@ -54,18 +54,26 @@ from torch.utils.data import TensorDataset, DataLoader
 # =============================================================================
 
 PROJECT_ROOT  = Path(__file__).resolve().parent.parent
-DATASET_FILE      = PROJECT_ROOT / "preprocessed_output" / "dataset_TRAINING.parquet"
-TEST_DATASET_FILE = PROJECT_ROOT / "preprocessed_output" / "dataset_TEST.parquet"
-MODELS_DIR    = PROJECT_ROOT / "models"
-MODELS_DIR.mkdir(exist_ok=True)
-CHECKPOINTS_DIR = MODELS_DIR / "halving_checkpoints"
+PREPROC_DIR   = PROJECT_ROOT / "preprocessed_output"
 
 ALL_LABELS   = sorted(["noGesture", "fist", "waveIn", "waveOut", "open", "pinch"])
 N_CLASSES    = len(ALL_LABELS)
 CHANNELS     = [f"ch{i}" for i in range(1, 9)]
 TD9_NAMES    = ["LS", "MFL", "MSR", "WAMP", "ZC", "RMS", "IAV", "DASDV", "VAR"]
-FEATURE_COLS = [f"{ch}_{feat}" for ch in CHANNELS for feat in TD9_NAMES]
-N_FEATURES   = len(FEATURE_COLS)  # 72
+ALL_FEATURE_COLS = [f"{ch}_{feat}" for ch in CHANNELS for feat in TD9_NAMES]
+META_COLS    = {"label", "user", "repetition", "gesture"}
+
+DATASET_FILES = {
+    72: ("dataset_TRAINING.parquet",            "dataset_TEST.parquet"),
+    36: ("dataset_TRAINING_reduced36.parquet",  "dataset_TESTING_reduced36.parquet"),
+    18: ("dataset_TRAINING_reduced18.parquet",  "dataset_TESTING_reduced18.parquet"),
+}
+
+# These globals are set in main() after CLI parsing
+MODELS_DIR      = None
+CHECKPOINTS_DIR = None
+FEATURE_COLS    = None
+N_FEATURES      = None
 
 
 # =============================================================================
@@ -702,7 +710,8 @@ def load_or_create_schedule(n_total, n_candidates, factor, n_splits,
 # =============================================================================
 
 def run_halving(model_name, estimator, param_distributions, X, y, groups,
-                n_candidates, factor, n_splits, random_state, resume):
+                n_candidates, factor, n_splits, random_state, resume,
+                n_features=72):
     """Run the full successive halving tournament for one model."""
 
     n_total = len(y)
@@ -896,7 +905,7 @@ def run_halving(model_name, estimator, param_distributions, X, y, groups,
     _save_final_model(final_est, model_name)
 
     # Evaluate on held-out test set
-    _evaluate_on_test_set(final_est, model_name)
+    _evaluate_on_test_set(final_est, model_name, n_features)
 
     return best_params
 
@@ -965,15 +974,18 @@ def _save_final_model(estimator, model_name):
               f"(condensed from full training set)")
 
 
-def _evaluate_on_test_set(estimator, model_name):
+def _evaluate_on_test_set(estimator, model_name, n_features):
     """Load the held-out test set, predict with the fitted model, and report."""
-    if not TEST_DATASET_FILE.exists():
-        print(f"\n  WARNING: {TEST_DATASET_FILE} not found — skipping test eval.")
+    _, test_name = DATASET_FILES[n_features]
+    test_file = PREPROC_DIR / test_name
+
+    if not test_file.exists():
+        print(f"\n  WARNING: {test_file} not found — skipping test eval.")
         return
 
-    print(f"\n  Evaluating on test set ({TEST_DATASET_FILE.name}) ...")
+    print(f"\n  Evaluating on test set ({test_file.name}) ...")
     t0 = time.time()
-    df = pd.read_parquet(TEST_DATASET_FILE)
+    df = pd.read_parquet(test_file)
     X_test = df[FEATURE_COLS].values.astype(np.float32)
 
     le = LabelEncoder()
@@ -1019,35 +1031,37 @@ def _evaluate_on_test_set(estimator, model_name):
 # Data loading
 # =============================================================================
 
-def load_data():
-    """Load dataset_TRAINING.parquet and return X, y, groups."""
-    if not DATASET_FILE.exists():
-        print(f"ERROR: {DATASET_FILE} not found.", file=sys.stderr)
+def load_data(n_features):
+    """Load training parquet for the requested feature set and return X, y, groups."""
+    global FEATURE_COLS, N_FEATURES
+
+    train_name, _ = DATASET_FILES[n_features]
+    dataset_file = PREPROC_DIR / train_name
+
+    if not dataset_file.exists():
+        print(f"ERROR: {dataset_file} not found.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"\n  Loading {DATASET_FILE.name} ...")
+    print(f"\n  Loading {dataset_file.name} ...")
     t0 = time.time()
-    df = pd.read_parquet(DATASET_FILE)
+    df = pd.read_parquet(dataset_file)
     print(f"  {len(df):,} rows × {len(df.columns)} cols  ({time.time()-t0:.1f}s)")
 
-    # Features
+    FEATURE_COLS = [c for c in df.columns if c not in META_COLS]
+    N_FEATURES = len(FEATURE_COLS)
     X = df[FEATURE_COLS].values.astype(np.float32)
 
-    # Labels — encode to integers for cross-model compatibility.
-    # String labels cause issues with XGBoost's num_class auto-detection
-    # when combined with sklearn's clone(). Integer labels work universally.
     le = LabelEncoder()
     le.fit(ALL_LABELS)
     y = le.transform(df["label"].values)
     label_map = dict(zip(le.transform(le.classes_), le.classes_))
 
-    # Groups (patient IDs)
     groups = df["user"].values
 
     del df
     gc.collect()
 
-    print(f"  Features: {X.shape}")
+    print(f"  Features: {X.shape}  ({N_FEATURES}f)")
     print(f"  Classes:  {label_map}")
     print(f"  Patients: {len(np.unique(groups))}")
 
@@ -1064,7 +1078,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--model", type=str, required=True,
-                   choices=["xgboost", "svm", "tdcnn", "knn", "all"],
+                   choices=["xgboost", "svm", "knn", "all"],
                    help="Model to search (or 'all').")
     p.add_argument("--n-candidates", type=int, default=100,
                    help="Number of initial random candidates.")
@@ -1072,6 +1086,8 @@ def parse_args():
                    help="Elimination factor (keep 1/factor each round).")
     p.add_argument("--n-splits", type=int, default=3,
                    help="Number of CV folds (StratifiedGroupKFold).")
+    p.add_argument("--features", type=int, default=72, choices=[72, 36, 18],
+                   help="Feature set to use (72=full, 36=top36, 18=top18).")
     p.add_argument("--no-gpu", action="store_true",
                    help="Force CPU even if CUDA is available.")
     p.add_argument("--no-resume", action="store_false", dest="resume",
@@ -1082,24 +1098,30 @@ def parse_args():
 
 
 def main():
+    global MODELS_DIR, CHECKPOINTS_DIR
+
     args = parse_args()
 
+    # Set up output directories based on feature set
+    nf = args.features
+    MODELS_DIR = PROJECT_ROOT / "models" / f"{nf}f"
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    CHECKPOINTS_DIR = MODELS_DIR / "halving_checkpoints"
+
     print("=" * 70)
-    print("  Successive Halving Hyperparameter Search  —  EMG-EPN612")
+    print(f"  Successive Halving Hyperparameter Search  —  EMG-EPN612  ({nf}f)")
     print("=" * 70)
 
-    # Load data once
-    X, y, groups = load_data()
+    X, y, groups = load_data(nf)
 
-    # Which models to search
     if args.model == "all":
-        models = ["xgboost", "svm", "tdcnn", "knn"]
+        models = ["xgboost", "svm", "knn"]
     else:
         models = [args.model]
 
     for model_name in models:
         print(f"\n\n{'#'*70}")
-        print(f"  MODEL: {model_name.upper()}")
+        print(f"  MODEL: {model_name.upper()}  ({nf}f)")
         print(f"{'#'*70}")
 
         estimator, param_dist, is_gpu = get_model_config(
@@ -1115,6 +1137,7 @@ def main():
             n_splits=args.n_splits,
             random_state=args.seed,
             resume=args.resume,
+            n_features=nf,
         )
 
     print(f"\n\n{'='*70}")
