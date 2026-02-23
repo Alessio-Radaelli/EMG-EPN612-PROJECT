@@ -67,6 +67,7 @@ EMG-EPN612 Dataset/
 *.pkl
 *.joblib
 *.parquet
+*.npz
 training_chunks/
 checkpoints/
 models/
