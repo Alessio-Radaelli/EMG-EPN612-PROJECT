@@ -11,7 +11,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from typing import Tuple, List, Optional, Union
-from .base_model import IModel, ModelState
 
 class ECA(nn.Module):
     """
@@ -90,26 +89,15 @@ class TDCNN(nn.Module):
         x = self.classifier(x)
         return x
 
-class TDCNNClassifier(IModel):
+class TDCNNClassifier:
     """
-    TDCNN + ECA Classifier wrapper.
+    TDCNN + ECA Classifier wrapper (Standalone).
     """
     def __init__(self, input_channels: int = 8, num_classes: int = 7,
                  hidden_channels: Tuple[int, ...] = (64, 128),
                  kernel_size: int = 3, dropout: float = 0.5,
                  learning_rate: float = 0.001, batch_size: int = 32,
                  epochs: int = 10, device: str = 'auto', verbose: bool = True):
-        super().__init__(
-            input_channels=input_channels,
-            num_classes=num_classes,
-            hidden_channels=hidden_channels,
-            kernel_size=kernel_size,
-            dropout=dropout,
-            learning_rate=learning_rate,
-            batch_size=batch_size,
-            epochs=epochs,
-            device=device
-        )
         
         self.input_channels = input_channels
         self.num_classes = num_classes
@@ -120,6 +108,11 @@ class TDCNNClassifier(IModel):
         self.batch_size = batch_size
         self.epochs = epochs
         self.verbose = verbose
+        
+        # Tracking variables previously handled by the IModel base class
+        self._is_trained = False
+        self._n_samples_seen = 0
+        self._n_updates = 0
         
         self.device = self._select_device(device)
         
@@ -162,6 +155,11 @@ class TDCNNClassifier(IModel):
         else:
             dataset = TensorDataset(X_tensor)
             return DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+
+    def _check_is_trained(self):
+        """Ensures the model has been fitted before allowing predictions."""
+        if not self._is_trained:
+            raise RuntimeError("This model is not trained yet. Call 'fit' before using predict().")
 
     def fit(self, X: np.ndarray, y: np.ndarray, X_val: Optional[np.ndarray] = None, y_val: Optional[np.ndarray] = None) -> 'TDCNNClassifier':
         """

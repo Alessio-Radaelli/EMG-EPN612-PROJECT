@@ -1,3 +1,20 @@
+# Ignore large datasets, models, and outputs
+datasets/dataset_A.pkl
+datasets/dataset_B.pkl
+preprocessed_output/dataset_TRAINING.npz
+preprocessed_output/dataset_TESTING.npz
+preprocessed_output/dataset_TRAINING.parquet
+preprocessed_output/dataset_TEST.parquet
+preprocessed_output/dataset_TESTING_reduced18.parquet
+preprocessed_output/dataset_TESTING_reduced36.parquet
+preprocessed_output/dataset_TRAINING_reduced18.parquet
+preprocessed_output/dataset_TRAINING_reduced36.parquet
+models/18f/
+models/36f/
+models/72f/
+result_collection/18f/
+# Ignore dataset.zip
+dataset.zip
 # Python
 __pycache__/
 *.py[cod]

@@ -23,7 +23,7 @@ from sklearn.base import clone
 from sklearn.metrics import accuracy_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scripts.hyperparam_search import (
+from scripts.hyperparam_searchXGBoost import (
     RFFSVMClassifier,
     TDCNNSklearnWrapper,
     _save_final_model,
