@@ -201,13 +201,93 @@ def _subsample_intra_patient(X, y, groups, n_target, rng):
     return X[idx], y[idx], groups[idx]
 
 # =============================================================================
+# Eval-only helper (load checkpoint and run on test set)
+# =============================================================================
+def evaluate_saved_model(n_features: int):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model_dir = PROJECT_ROOT / "models" / f"{n_features}f"
+    ckpt_path = model_dir / "svm_val_best.pt"
+    if not ckpt_path.exists():
+        print(f"ERROR: checkpoint not found at {ckpt_path}. Run the tournament first.")
+        return
+
+    print(f"\n[Eval-only] Loading checkpoint from {ckpt_path} on {device} ...")
+    ckpt = torch.load(ckpt_path, map_location=device)
+    params = ckpt.get("params", {})
+
+    # Rebuild classifier core
+    clf = RFFSVMClassifier(**params)
+    W = ckpt["W"].to(device)
+    b = ckpt["b"].to(device)
+    n_cls = N_CLASSES
+    linear = nn.Linear(W.shape[1], n_cls).to(device)
+    linear.load_state_dict(ckpt["model_state_dict"])
+    linear.eval()
+
+    # Set model_ and a simple numeric label encoder (0..n_cls-1)
+    clf.model_ = (W, b, linear)
+    clf.le_ = LabelEncoder()
+    clf.le_.fit(list(range(n_cls)))
+    clf.classes_ = clf.le_.classes_
+
+    # Load held-out test set for this feature count
+    _, test_name = DATASET_FILES[n_features]
+    df_test = pd.read_parquet(PREPROC_DIR / test_name)
+    feature_cols = [c for c in df_test.columns if c in ALL_FEATURE_COLS]
+    X_test = df_test[feature_cols].values.astype(np.float32)
+
+    le_global = LabelEncoder().fit(ALL_LABELS)
+    y_test = le_global.transform(df_test["label"].values)
+    del df_test; gc.collect()
+
+    print(f"  Test samples: {len(y_test):,}")
+    t0 = time.time()
+    y_pred = clf.predict(X_test)
+    acc = float(accuracy_score(y_test, y_pred))
+    report_str = classification_report(y_test, y_pred, target_names=ALL_LABELS, digits=4)
+    report_dict = classification_report(y_test, y_pred, target_names=ALL_LABELS, digits=4, output_dict=True)
+    elapsed = time.time() - t0
+
+    print(f"\n[Eval-only] Test Accuracy: {acc:.4f}  ({elapsed:.1f}s)")
+    print(report_str)
+
+    # Save eval-only results alongside tournament results
+    out_dir = PROJECT_ROOT / "models" / f"{n_features}f"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results = {
+        "script": "svm_val",
+        "mode": "eval_only",
+        "n_features": n_features,
+        "loaded_params": params,
+        "test_accuracy": acc,
+        "classification_report": report_dict,
+        "test_samples": len(y_test),
+        "eval_time_s": round(elapsed, 1),
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    results_file = out_dir / "svm_val_test_results_eval.json"
+    results_file.write_text(json.dumps(results, indent=2, default=str))
+    print(f"\n[Eval-only] Results saved to: {results_file}")
+
+
+# =============================================================================
 # Main Tournament Script
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--features", type=int, default=72, choices=[72, 36, 18])
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Only evaluate the saved svm_val_best.pt on the test set (skip tournament).",
+    )
     args = parser.parse_args()
     nf = args.features
+
+    if args.eval_only:
+        evaluate_saved_model(nf)
+        return
 
     # 1. Load Data
     print(f"\n[1/4] Loading Data ({nf}f)...")
@@ -291,11 +371,12 @@ def main():
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_dir / "svm_val_best.pt"
     W, b, linear = final_clf.model_
+    # Keep tensors on their current device for consistent inference; device can be handled at load time.
     torch.save(
         {
-            "model_state_dict": linear.cpu().state_dict(),
-            "W": W.cpu(),
-            "b": b.cpu(),
+            "model_state_dict": linear.state_dict(),
+            "W": W,
+            "b": b,
             "params": winner_params,
         },
         model_path,
