@@ -1,0 +1,212 @@
+{
+  "round": 0,
+  "n_samples": 512683,
+  "n_candidates": 12,
+  "n_survivors": 4,
+  "all_scores": [
+    {
+      "params": {
+        "n_neighbors": 5,
+        "weights": "distance",
+        "metric": "euclidean"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.8
+    },
+    {
+      "params": {
+        "n_neighbors": 5,
+        "weights": "uniform",
+        "metric": "manhattan"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.7
+    },
+    {
+      "params": {
+        "n_neighbors": 1,
+        "weights": "uniform",
+        "metric": "euclidean"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.7
+    },
+    {
+      "params": {
+        "n_neighbors": 5,
+        "weights": "uniform",
+        "metric": "euclidean"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.7
+    },
+    {
+      "params": {
+        "n_neighbors": 3,
+        "weights": "uniform",
+        "metric": "manhattan"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.7
+    },
+    {
+      "params": {
+        "n_neighbors": 1,
+        "weights": "distance",
+        "metric": "euclidean"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.7
+    },
+    {
+      "params": {
+        "n_neighbors": 1,
+        "weights": "uniform",
+        "metric": "manhattan"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.7
+    },
+    {
+      "params": {
+        "n_neighbors": 5,
+        "weights": "distance",
+        "metric": "manhattan"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.7
+    },
+    {
+      "params": {
+        "n_neighbors": 3,
+        "weights": "uniform",
+        "metric": "euclidean"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.7
+    },
+    {
+      "params": {
+        "n_neighbors": 3,
+        "weights": "distance",
+        "metric": "manhattan"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.7
+    },
+    {
+      "params": {
+        "n_neighbors": 1,
+        "weights": "distance",
+        "metric": "manhattan"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.7
+    },
+    {
+      "params": {
+        "n_neighbors": 3,
+        "weights": "distance",
+        "metric": "euclidean"
+      },
+      "mean_score": 0.0,
+      "std_score": 0.0,
+      "fold_scores": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "time_s": 0.7
+    }
+  ],
+  "survivors": [
+    {
+      "n_neighbors": 5,
+      "weights": "distance",
+      "metric": "euclidean"
+    },
+    {
+      "n_neighbors": 5,
+      "weights": "uniform",
+      "metric": "manhattan"
+    },
+    {
+      "n_neighbors": 1,
+      "weights": "uniform",
+      "metric": "euclidean"
+    },
+    {
+      "n_neighbors": 5,
+      "weights": "uniform",
+      "metric": "euclidean"
+    }
+  ],
+  "elapsed_s": 8.5,
+  "timestamp": "2026-02-22 19:15:49"
+}

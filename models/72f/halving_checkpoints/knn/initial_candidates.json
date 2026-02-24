@@ -1,0 +1,62 @@
+[
+  {
+    "n_neighbors": 5,
+    "weights": "distance",
+    "metric": "euclidean"
+  },
+  {
+    "n_neighbors": 5,
+    "weights": "uniform",
+    "metric": "manhattan"
+  },
+  {
+    "n_neighbors": 1,
+    "weights": "uniform",
+    "metric": "euclidean"
+  },
+  {
+    "n_neighbors": 5,
+    "weights": "uniform",
+    "metric": "euclidean"
+  },
+  {
+    "n_neighbors": 3,
+    "weights": "uniform",
+    "metric": "manhattan"
+  },
+  {
+    "n_neighbors": 1,
+    "weights": "distance",
+    "metric": "euclidean"
+  },
+  {
+    "n_neighbors": 1,
+    "weights": "uniform",
+    "metric": "manhattan"
+  },
+  {
+    "n_neighbors": 5,
+    "weights": "distance",
+    "metric": "manhattan"
+  },
+  {
+    "n_neighbors": 3,
+    "weights": "uniform",
+    "metric": "euclidean"
+  },
+  {
+    "n_neighbors": 3,
+    "weights": "distance",
+    "metric": "manhattan"
+  },
+  {
+    "n_neighbors": 1,
+    "weights": "distance",
+    "metric": "manhattan"
+  },
+  {
+    "n_neighbors": 3,
+    "weights": "distance",
+    "metric": "euclidean"
+  }
+]

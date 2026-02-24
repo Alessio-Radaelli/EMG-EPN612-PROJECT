@@ -1,99 +1,11 @@
-# Ignore large datasets, models, and outputs
+EMG-EPN612 Dataset/
+models/18f/calibrated_users/
+models/18f/halving_checkpoints/
+*.joblib
+*_best_halving.json
+preprocessed_output/
+preprocessed_users/
+__pycache__/
+*.npz
 datasets/dataset_A.pkl
 datasets/dataset_B.pkl
-preprocessed_output/dataset_TRAINING.npz
-preprocessed_output/dataset_TESTING.npz
-preprocessed_output/dataset_TRAINING.parquet
-preprocessed_output/dataset_TEST.parquet
-preprocessed_output/dataset_TESTING_reduced18.parquet
-preprocessed_output/dataset_TESTING_reduced36.parquet
-preprocessed_output/dataset_TRAINING_reduced18.parquet
-preprocessed_output/dataset_TRAINING_reduced36.parquet
-models/18f/
-models/36f/
-models/72f/
-result_collection/18f/
-# Ignore dataset.zip
-dataset.zip
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
-.env
-.venv
-env/
-venv/
-ENV/
-.conda/
-
-# Jupyter Notebook
-.ipynb_checkpoints/
-*.ipynb_checkpoints
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Data files (large dataset - should be downloaded separately)
-EMG-EPN612 Dataset/
-
-# Model checkpoints and outputs
-*.pth
-*.pt
-*.json
-*.h5
-*.pkl
-*.joblib
-*.parquet
-*.npz
-training_chunks/
-checkpoints/
-models/
-outputs/
-
-# Logs
-logs/
-*.log
-
-# Temporary files
-*.tmp
-*.temp
-
-# CUDA check utility
-check_cuda.py
-cuda_check_result.txt
-
-# Scripts - helper/output files
-scripts/check_segment_lengths.py
-scripts/build_training_set.py
-scripts/precalculate_dtw_distances.py
-scripts/_verify_output.txt
-scripts/_dtw_help.txt
-
-# Precomputed DTW distances
-dtw_distances/

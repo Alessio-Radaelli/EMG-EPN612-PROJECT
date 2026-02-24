@@ -1,0 +1,29 @@
+{
+  "dataset_rows": 1536960,
+  "n_candidates": 100,
+  "factor": 3,
+  "n_splits": 3,
+  "random_state": 42,
+  "rounds": [
+    {
+      "round": 0,
+      "n_candidates": 100,
+      "n_samples": 56924
+    },
+    {
+      "round": 1,
+      "n_candidates": 33,
+      "n_samples": 170772
+    },
+    {
+      "round": 2,
+      "n_candidates": 11,
+      "n_samples": 512316
+    },
+    {
+      "round": 3,
+      "n_candidates": 3,
+      "n_samples": 1536948
+    }
+  ]
+}
