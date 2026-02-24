@@ -17,6 +17,7 @@ Usage:
 import sys
 import time
 import json
+import csv
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,9 @@ PREPROC_DIR = PROJECT_ROOT / "preprocessed_output"
 MODELS_DIR = PROJECT_ROOT / "models" / "18f"
 NPZ_TEST_PATH = PREPROC_DIR / "dataset_TESTING.npz"
 BENCHMARK_RESULTS_PATH = MODELS_DIR / "benchmark_inference_results.json"
+STATS_ANALYSIS_PATH = MODELS_DIR / "benchmark_stats_analysis.json"
+STATS_TABLE_PATH = MODELS_DIR / "benchmark_stats_table.png"
+STATS_TABLE_CSV_PATH = MODELS_DIR / "benchmark_stats_table.csv"
 
 # Model paths (TDCNN lives in models/ root; others in models/18f/)
 KNN_PATH = MODELS_DIR / "knn_faiss_gpu_enn_manhattan_k1_wuniform.joblib"
@@ -289,11 +293,17 @@ def run_benchmark():
 
     # Display & Save Results
     _print_summary(results)
-    _print_statistical_analysis(results)
+    meta, comparisons = _compute_statistical_analysis(results)
+    _print_statistical_analysis(meta, comparisons)
+    if meta and comparisons:
+        _save_statistical_analysis(meta, comparisons, MODELS_DIR)
     _save_visualizations(results, MODELS_DIR)
     
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    BENCHMARK_RESULTS_PATH.write_text(json.dumps(results, indent=2))
+    output = dict(results)
+    if meta and comparisons:
+        output["statistical_analysis"] = {"meta": meta, "comparisons": comparisons}
+    BENCHMARK_RESULTS_PATH.write_text(json.dumps(output, indent=2))
     print(f"\nResults saved to {BENCHMARK_RESULTS_PATH}")
 
 
@@ -310,38 +320,144 @@ def _print_summary(results):
     print("=" * 80)
 
 
-def _print_statistical_analysis(results):
-    """Performs non-parametric statistical tests on Latency execution times."""
-    print("\n" + "=" * 80)
-    print("  STATISTICAL ANALYSIS: PAIRWISE LATENCY DIFFERENCES")
-    print("=" * 80)
-    
+def _compute_statistical_analysis(results):
+    """Performs non-parametric statistical tests on Latency execution times.
+    Returns list of pairwise comparisons with p-values and significance."""
     models = list(results.keys())
     if len(models) < 2:
-        return
-        
+        return None, []
+
     n_comp = len(models) * (len(models) - 1) // 2
     alpha_bonf = 0.05 / n_comp
-    
-    print(f"  Test: Mann-Whitney U (Non-parametric)")
-    print(f"  Correction: Bonferroni (α = {alpha_bonf:.4f} for {n_comp} comparisons)\n")
-    
+    comparisons = []
+
     for i in range(len(models)):
         for j in range(i + 1, len(models)):
             m1, m2 = models[i], models[j]
             t1 = results[m1]["latency_ms"]["raw_total_times"]
             t2 = results[m2]["latency_ms"]["raw_total_times"]
-            
-            # Two-sided Mann-Whitney U test
+
             stat, p_raw = stats.mannwhitneyu(t1, t2, alternative="two-sided")
             p_adj = min(p_raw * n_comp, 1.0)
-            
+
             sig = "***" if p_adj < 0.001 else "**" if p_adj < 0.01 else "*" if p_adj < 0.05 else "n.s."
             diff_ms = np.median(t1) - np.median(t2)
             faster = m2 if diff_ms > 0 else m1
-            
-            print(f"  {m1} vs {m2:10} | p_adj = {p_adj:.4e} {sig:<4} | {faster} is faster by {abs(diff_ms):.3f} ms")
+            median1, median2 = np.median(t1), np.median(t2)
+
+            comparisons.append({
+                "model_a": m1,
+                "model_b": m2,
+                "test": "Mann-Whitney U",
+                "statistic": float(stat),
+                "p_raw": float(p_raw),
+                "p_adj_bonferroni": float(p_adj),
+                "significant": sig,
+                "median_a_ms": float(median1),
+                "median_b_ms": float(median2),
+                "diff_ms": float(abs(diff_ms)),
+                "faster": faster,
+            })
+
+    meta = {
+        "test": "Mann-Whitney U",
+        "correction": "Bonferroni",
+        "n_comparisons": n_comp,
+        "alpha": 0.05,
+        "alpha_bonferroni": alpha_bonf,
+    }
+    return meta, comparisons
+
+
+def _print_statistical_analysis(meta, comparisons):
+    """Prints statistical analysis to console."""
+    if not comparisons:
+        return
+
+    print("\n" + "=" * 80)
+    print("  STATISTICAL ANALYSIS: PAIRWISE LATENCY DIFFERENCES")
     print("=" * 80)
+    print(f"  Test: {meta['test']} (Non-parametric)")
+    print(f"  Correction: {meta['correction']} (α = {meta['alpha_bonferroni']:.4f} for {meta['n_comparisons']} comparisons)\n")
+
+    for c in comparisons:
+        m1, m2 = c["model_a"], c["model_b"]
+        sig = c["significant"]
+        p_adj = c["p_adj_bonferroni"]
+        faster = c["faster"]
+        diff_ms = c["diff_ms"]
+        print(f"  {m1} vs {m2:10} | p_adj = {p_adj:.4e} {sig:<4} | {faster} is faster by {diff_ms:.3f} ms")
+    print("=" * 80)
+
+
+def _save_statistical_analysis(meta, comparisons, out_dir):
+    """Saves statistical analysis to JSON and creates a table image."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save full analysis to JSON
+    data = {"meta": meta, "comparisons": comparisons}
+    STATS_ANALYSIS_PATH.write_text(json.dumps(data, indent=2))
+    print(f"Statistical analysis saved to {STATS_ANALYSIS_PATH}")
+
+    # Save table as CSV
+    with open(STATS_TABLE_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Model A", "Model B", "p_raw", "p_adj_bonferroni", "Significant", "Median A (ms)", "Median B (ms)", "Faster Model", "Δ Median (ms)"])
+        for c in comparisons:
+            writer.writerow([
+                c["model_a"], c["model_b"], c["p_raw"], c["p_adj_bonferroni"],
+                c["significant"], c["median_a_ms"], c["median_b_ms"], c["faster"], c["diff_ms"]
+            ])
+    print(f"Statistical table (CSV) saved to {STATS_TABLE_CSV_PATH}")
+
+    # Create and save table as image
+    if not comparisons:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, max(4, len(comparisons) * 0.6)))
+    ax.axis("off")
+
+    cols = ["Model A", "Model B", "p (adj)", "Significant", "Faster Model", "Δ Median (ms)"]
+    cell_text = []
+    for c in comparisons:
+        cell_text.append([
+            c["model_a"],
+            c["model_b"],
+            f"{c['p_adj_bonferroni']:.4e}",
+            c["significant"],
+            c["faster"],
+            f"{c['diff_ms']:.3f}",
+        ])
+
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=cols,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 2.0)
+
+    # Header styling
+    for j in range(len(cols)):
+        table[(0, j)].set_facecolor("#457b9d")
+        table[(0, j)].set_text_props(color="white", weight="bold")
+
+    # Alternating row colors
+    for i in range(1, len(cell_text) + 1):
+        for j in range(len(cols)):
+            if i % 2 == 0:
+                table[(i, j)].set_facecolor("#e9ecef")
+
+    ax.set_title(f"Statistical Analysis: Pairwise Latency Differences\n"
+                 f"Test: {meta['test']} | Correction: {meta['correction']} (α={meta['alpha']})",
+                 fontsize=12, pad=20)
+    fig.tight_layout()
+    fig.savefig(out_dir / "benchmark_stats_table.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Statistical table saved to {STATS_TABLE_PATH}")
 
 
 def _save_visualizations(results, out_dir):

@@ -1,0 +1,89 @@
+{
+  "meta": {
+    "test": "Mann-Whitney U",
+    "correction": "Bonferroni",
+    "n_comparisons": 6,
+    "alpha": 0.05,
+    "alpha_bonferroni": 0.008333333333333333
+  },
+  "comparisons": [
+    {
+      "model_a": "TDCNN",
+      "model_b": "KNN",
+      "test": "Mann-Whitney U",
+      "statistic": 0.0,
+      "p_raw": 5.855952942750112e-165,
+      "p_adj_bonferroni": 3.513571765650067e-164,
+      "significant": "***",
+      "median_a_ms": 2.455450000525161,
+      "median_b_ms": 14.597100000628416,
+      "diff_ms": 12.141650000103255,
+      "faster": "TDCNN"
+    },
+    {
+      "model_a": "TDCNN",
+      "model_b": "XGBoost",
+      "test": "Mann-Whitney U",
+      "statistic": 0.0,
+      "p_raw": 5.8559134023905755e-165,
+      "p_adj_bonferroni": 3.513548041434345e-164,
+      "significant": "***",
+      "median_a_ms": 2.455450000525161,
+      "median_b_ms": 7.02194999985295,
+      "diff_ms": 4.566499999327789,
+      "faster": "TDCNN"
+    },
+    {
+      "model_a": "TDCNN",
+      "model_b": "SVM",
+      "test": "Mann-Whitney U",
+      "statistic": 224061.0,
+      "p_raw": 2.429397521507147e-104,
+      "p_adj_bonferroni": 1.4576385129042882e-103,
+      "significant": "***",
+      "median_a_ms": 2.455450000525161,
+      "median_b_ms": 1.421400000253925,
+      "diff_ms": 1.034050000271236,
+      "faster": "SVM"
+    },
+    {
+      "model_a": "KNN",
+      "model_b": "XGBoost",
+      "test": "Mann-Whitney U",
+      "statistic": 250000.0,
+      "p_raw": 5.8560979263397435e-165,
+      "p_adj_bonferroni": 3.513658755803846e-164,
+      "significant": "***",
+      "median_a_ms": 14.597100000628416,
+      "median_b_ms": 7.02194999985295,
+      "diff_ms": 7.575150000775466,
+      "faster": "XGBoost"
+    },
+    {
+      "model_a": "KNN",
+      "model_b": "SVM",
+      "test": "Mann-Whitney U",
+      "statistic": 250000.0,
+      "p_raw": 5.856084745866025e-165,
+      "p_adj_bonferroni": 3.513650847519615e-164,
+      "significant": "***",
+      "median_a_ms": 14.597100000628416,
+      "median_b_ms": 1.421400000253925,
+      "diff_ms": 13.17570000037449,
+      "faster": "SVM"
+    },
+    {
+      "model_a": "XGBoost",
+      "model_b": "SVM",
+      "test": "Mann-Whitney U",
+      "statistic": 247418.0,
+      "p_raw": 2.6826796164274343e-158,
+      "p_adj_bonferroni": 1.6096077698564607e-157,
+      "significant": "***",
+      "median_a_ms": 7.02194999985295,
+      "median_b_ms": 1.421400000253925,
+      "diff_ms": 5.600549999599025,
+      "faster": "SVM"
+    }
+  ]
+}

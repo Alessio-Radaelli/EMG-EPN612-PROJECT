@@ -14,9 +14,9 @@ RESULTS_DIR = PROJECT_ROOT / "models"
 # Usiamo il set a 36 feature per i modelli ML come "baseline" ottimizzata, 
 # e il raw signal per la TDCNN.
 MODEL_FILES = {
-    "SVM (36f)": RESULTS_DIR / "36f" / "svm_val_test_results36.json",
-    "XGBoost (36f)": RESULTS_DIR / "36f" / "xgboost36_test_results.json",
-    "KNN (36f)": RESULTS_DIR / "36f" / "knn_test_results36.json",
+    "SVM (18f)": RESULTS_DIR / "18f" / "svm_val_test_results18.json",
+    "XGBoost (18f)": RESULTS_DIR / "18f" / "xgboost18_test_results.json",
+    "KNN (18f)": RESULTS_DIR / "18f" / "knn_test_results18.json",
     "TDCNN (Raw)": RESULTS_DIR / "tdcnn_test_results.json"
 }
 

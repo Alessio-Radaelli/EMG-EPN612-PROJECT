@@ -1,0 +1,25 @@
+Model,Gesture,Precision (%),Recall (%),F1-Score (%)
+KNN,fist,55.7,60.38,57.95
+KNN,noGesture,95.78,95.3,95.54
+KNN,open,46.49,48.15,47.3
+KNN,pinch,51.75,55.1,53.38
+KNN,waveIn,63.92,57.35,60.46
+KNN,waveOut,62.72,58.13,60.34
+SVM,fist,66.47,60.62,63.41
+SVM,noGesture,95.13,98.51,96.79
+SVM,open,52.79,52.2,52.49
+SVM,pinch,55.36,63.34,59.08
+SVM,waveIn,68.34,61.92,64.97
+SVM,waveOut,64.05,64.87,64.45
+TDCNN,fist,72.64,68.61,70.57
+TDCNN,noGesture,91.32,97.99,94.54
+TDCNN,open,60.11,64.45,62.2
+TDCNN,pinch,68.79,68.41,68.6
+TDCNN,waveIn,71.35,73.87,72.59
+TDCNN,waveOut,74.43,66.71,70.36
+XGBoost,fist,66.57,60.71,63.5
+XGBoost,noGesture,95.53,97.77,96.63
+XGBoost,open,52.33,53.43,52.88
+XGBoost,pinch,55.08,63.31,58.91
+XGBoost,waveIn,68.5,62.03,65.11
+XGBoost,waveOut,64.71,64.17,64.43

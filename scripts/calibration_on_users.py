@@ -19,7 +19,7 @@ from tqdm import tqdm
 # Importa i tuoi moduli custom
 from tdcnn_eca import TDCNNClassifier
 from train_knn import FaissKNNClassifierGPU, faiss_enn_gpu
-from svm_val import RFFSVMClassifier
+from train_svm import RFFSVMClassifier
 
 # =============================================================================
 # 1. Configurazione e Percorsi
@@ -36,6 +36,8 @@ CALIBRATED_MODELS_DIR = MODELS_DIR / "calibrated_users"
 CALIBRATED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_EXPORT_DIR = PROJECT_ROOT / "results"
 RESULTS_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+CALIBRATION_EXPORT_DIR = PROJECT_ROOT / "preprocessed_output" / "calibration_results"
+CALIBRATION_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Flag per salvare i pesi dei modelli (Mettilo a True se vuoi salvare i 120 file dei modelli)
 SAVE_CALIBRATED_MODELS = True
@@ -479,8 +481,52 @@ def main():
     
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines))
+
+    # --- Export per visualize_calibration_results.py ---
+    model_order = ["TDCNN", "SVM", "XGBoost", "KNN"]
+    df_zs_exp = df_zs[[c for c in model_order if c in df_zs.columns]]
+    df_cal_exp = df_cal[[c for c in model_order if c in df_cal.columns]]
+    df_zs_exp.to_csv(CALIBRATION_EXPORT_DIR / "zero_shot_accuracies.csv", index_label="")
+    df_cal_exp.to_csv(CALIBRATION_EXPORT_DIR / "calibrated_accuracies.csv", index_label="")
+    df_all = pd.concat([df_zs_exp.add_suffix("_zs"), df_cal_exp.add_suffix("_cal")], axis=1)
+    df_all.to_csv(CALIBRATION_EXPORT_DIR / "all_results.csv")
+    wilcoxon_cal = {}
+    for model in model_order:
+        if model in df_zs.columns:
+            try:
+                stat_w, p_w = stats.wilcoxon(df_zs[model], df_cal[model])
+                wilcoxon_cal[model] = {"statistic": float(stat_w), "p_value": float(p_w)}
+            except ValueError:
+                wilcoxon_cal[model] = {"statistic": 0, "p_value": 1.0}
+    wilcoxon_posthoc = {}
+    for baseline in ["SVM", "XGBoost", "KNN"]:
+        if baseline in df_cal.columns:
+            try:
+                stat_w, p_w = stats.wilcoxon(df_cal["TDCNN"], df_cal[baseline])
+                adv = (df_cal["TDCNN"].mean() - df_cal[baseline].mean()) * 100
+                wilcoxon_posthoc[f"TDCNN_vs_{baseline}"] = {
+                    "statistic": float(stat_w), "p_value": float(p_w), "tdcnn_advantage_pct": float(adv)
+                }
+            except ValueError:
+                wilcoxon_posthoc[f"TDCNN_vs_{baseline}"] = {"statistic": 0, "p_value": 1.0, "tdcnn_advantage_pct": 0}
+    calib_summary = {
+        "config": {
+            "calibration_reps": CALIBRATION_REPS,
+            "random_seed": RANDOM_SEED,
+            "max_test_users": MAX_TEST_USERS,
+            "selected_users": [str(u) for u in selected_users],
+        },
+        "means_zero_shot": {m: float(df_zs[m].mean() * 100) for m in model_order if m in df_zs.columns},
+        "means_calibrated": {m: float(df_cal[m].mean() * 100) for m in model_order if m in df_cal.columns},
+        "wilcoxon_calibration_effect": wilcoxon_cal,
+        "friedman_postcalibration": {"statistic": float(stat), "p_value": float(p_friedman)},
+        "wilcoxon_posthoc_tdcnn_vs_baselines": wilcoxon_posthoc,
+    }
+    with open(CALIBRATION_EXPORT_DIR / "calibration_stats_summary.json", "w", encoding="utf-8") as f:
+        json.dump(calib_summary, f, indent=2)
         
     print(f"\n✓ Salvataggio completato! Risultati esportati in: {RESULTS_EXPORT_DIR}")
+    print(f"✓ Dati per visualizzazione esportati in: {CALIBRATION_EXPORT_DIR}")
 
 if __name__ == "__main__":
     main()
