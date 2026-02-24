@@ -190,7 +190,7 @@ if __name__ == "__main__":
     model = TDCNNClassifier(
         input_channels=8,
         num_classes=num_classes,
-        hidden_channels=(64, 128,256),
+        hidden_channels=(64, 128, 256),
         kernel_size=3,
         dropout=0.4,
         learning_rate=0.001,

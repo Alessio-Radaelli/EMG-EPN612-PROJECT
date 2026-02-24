@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 import argparse
@@ -154,16 +155,104 @@ def subsample_by_group(X, y, groups, n_target):
     return X[np.sort(selected_idx)], y[np.sort(selected_idx)], groups[np.sort(selected_idx)]
 
 # =============================================================================
+# Eval-only: Load saved model and evaluate on test set
+# =============================================================================
+def evaluate_saved_model(n_features: int):
+    """Load the best KNN model for n_features, evaluate on test set, save results JSON."""
+    MODELS_DIR = PROJECT_ROOT / "models" / f"{n_features}f"
+    joblib_files = list(MODELS_DIR.glob("knn*_faiss_gpu_enn_*.joblib"))
+    if not joblib_files:
+        joblib_files = list(MODELS_DIR.glob("knn_faiss_gpu_enn_*.joblib"))
+    if not joblib_files:
+        raise FileNotFoundError(
+            f"No KNN model found in {MODELS_DIR}. "
+            f"Expected patterns: knn{{nf}}_faiss_gpu_enn_*.joblib or knn_faiss_gpu_enn_*.joblib"
+        )
+    # Use most recently modified if multiple
+    model_path = max(joblib_files, key=lambda p: p.stat().st_mtime)
+    print(f"  Loading: {model_path.name}")
+
+    data = joblib.load(model_path)
+    X_store = data["X_store"]
+    y_store = data["y_store"]
+    params = data["params"]
+    expected_dim = X_store.shape[1]
+    feature_cols = data.get("feature_cols")
+
+    clf = FaissKNNClassifierGPU(n_neighbors=params["n_neighbors"], metric=params["metric"])
+    clf.fit(X_store, y_store)
+
+    train_name, test_name = DATASET_FILES[n_features]
+    df_test = pd.read_parquet(PREPROC_DIR / test_name)
+    if feature_cols is None:
+        # Fallback for models saved before feature_cols was stored: use training parquet column order
+        df_train = pd.read_parquet(PREPROC_DIR / train_name)
+        feature_cols = [c for c in df_train.columns if c in ALL_FEATURE_COLS]
+        del df_train
+        if len(feature_cols) != expected_dim:
+            raise ValueError(
+                f"Model expects {expected_dim} features but training parquet has {len(feature_cols)}. "
+                f"Re-train the model with the current train_knn.py to save feature_cols."
+            )
+        missing = [c for c in feature_cols if c not in df_test.columns]
+        if missing:
+            raise ValueError(f"Test parquet missing columns from training: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+    else:
+        missing = [c for c in feature_cols if c not in df_test.columns]
+        if missing:
+            raise ValueError(f"Test parquet missing model columns: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+    X_test = df_test[feature_cols].values.astype(np.float32)
+    le = LabelEncoder().fit(ALL_LABELS)
+    y_test_enc = le.transform(df_test["label"].values)
+    y_test_str = le.inverse_transform(y_test_enc)
+    del df_test
+
+    print(f"  Test samples: {len(y_test_str):,}")
+    t0 = time.time()
+    y_pred_enc = clf.predict(X_test)
+    total_time_s = time.time() - t0
+    y_pred_str = le.inverse_transform(y_pred_enc)
+    acc = float(accuracy_score(y_test_str, y_pred_str))
+    report_dict = classification_report(
+        y_test_str, y_pred_str, target_names=ALL_LABELS, digits=4, output_dict=True
+    )
+    print(f"\n  Test Accuracy: {acc:.4f}")
+    print(classification_report(y_test_str, y_pred_str, target_names=ALL_LABELS, digits=4))
+
+    results = {
+        "script": "train_knn",
+        "n_features": n_features,
+        "winner_params": params,
+        "test_accuracy": acc,
+        "classification_report": report_dict,
+        "test_samples": len(y_test_str),
+        "total_time_s": total_time_s,
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    results_file = MODELS_DIR / f"knn_test_results{n_features}.json"
+    results_file.write_text(json.dumps(results, indent=2, default=str))
+    print(f"\n  Results saved to: {results_file}")
+
+
+# =============================================================================
 # Main Script
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--features", type=int, default=72, choices=[72, 36, 18])
+    parser.add_argument("--eval", action="store_true", help="Only evaluate saved model on test set")
     args = parser.parse_args()
     nf = args.features
 
     MODELS_DIR = PROJECT_ROOT / "models" / f"{nf}f"
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.eval:
+        print("======================================================")
+        print(f" KNN Eval-only — {nf} Features")
+        print("======================================================")
+        evaluate_saved_model(nf)
+        return
 
     print("======================================================")
     print(f" FAISS-GPU KNN Grid Search — {nf} Features")
@@ -234,12 +323,13 @@ def main():
     clf = FaissKNNClassifierGPU(n_neighbors=best_params["n_neighbors"], metric=best_params["metric"])
     clf.fit(X_clean, y_clean)
 
-    # Save model arrays
+    # Save model arrays (include feature_cols for eval to use correct columns)
     save_path = MODELS_DIR / f"knn_faiss_gpu_enn_{best_params['metric']}_k{best_params['n_neighbors']}_w{best_params['weight']}.joblib"
     joblib.dump({
         "X_store": X_clean,
         "y_store": y_clean,
         "params": best_params,
+        "feature_cols": feature_cols,
     }, save_path)
     print(f"      Saved to {save_path}")
 

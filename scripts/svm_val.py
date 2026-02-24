@@ -80,7 +80,7 @@ class RFFSVMClassifier(BaseEstimator, ClassifierMixin):
         best_val_acc = 0.0
         best_linear_state = None
         wait = 0
-        crit = nn.CrossEntropyLoss()
+        crit = nn.MultiMarginLoss()  # Multiclass hinge loss (Crammer-Singer), equivalent to SVM
 
         epoch_pbar = tqdm(range(self.max_epochs), desc="Epochs", leave=False)
         for epoch in epoch_pbar:

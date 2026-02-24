@@ -1,9 +1,14 @@
+import json
 import pickle
+import time
+from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from pathlib import Path
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
 from tdcnn_eca import TDCNNClassifier
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -12,6 +17,7 @@ from tdcnn_eca import TDCNNClassifier
 TEST_DATA_PATH = Path("preprocessed_output") / "dataset_TESTING.npz"
 MODEL_PATH = Path("models") / "tdcnn_emg_model.pth"
 ENCODER_PATH = Path("models") / "label_encoder.pkl"
+RESULTS_PATH = Path("models") / "tdcnn_test_results.json"
 
 def main():
     # 1. Load the preprocessed testing data
@@ -42,16 +48,38 @@ def main():
     print(f"Loading model from {MODEL_PATH}...")
     model = TDCNNClassifier.load(str(MODEL_PATH))
 
-    # 4. Run Inference
+    # 4. Run Inference (timed)
     print("Running predictions on the test set. This may take a moment...")
+    t0 = time.time()
     y_pred = model.predict(X_test)
+    total_time_s = time.time() - t0
+
+    test_accuracy = float(accuracy_score(y_true, y_pred))
+    report_dict = classification_report(
+        y_true, y_pred, target_names=le.classes_, digits=4, output_dict=True
+    )
 
     # 5. Generate Classification Report
     print("\n" + "═"*60)
     print("CLASSIFICATION REPORT")
     print("═"*60)
-    # The classification report calculates precision, recall, and F1-score for each gesture
-    print(classification_report(y_true, y_pred, target_names=le.classes_))
+    print(classification_report(y_true, y_pred, target_names=le.classes_, digits=4))
+
+    # Save metrics in same format as svm_val_test_results*.json
+    n_features = int(np.prod(X_test.shape[1:])) if len(X_test.shape) > 1 else X_test.shape[1]
+    results = {
+        "script": "eval_tcnn",
+        "n_features": n_features,
+        "winner_params": {},
+        "test_accuracy": test_accuracy,
+        "classification_report": report_dict,
+        "test_samples": len(y_true),
+        "total_time_s": round(total_time_s, 1),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RESULTS_PATH.write_text(json.dumps(results, indent=2, default=str))
+    print(f"\n✓ Results saved to {RESULTS_PATH}")
 
     # 6. Generate and Plot Confusion Matrix
     print("\nGenerating Confusion Matrix...")

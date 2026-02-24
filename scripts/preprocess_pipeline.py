@@ -53,7 +53,7 @@ NUM_WORKERS   = 8         # parallel worker processes
 CHUNK_SIZE    = 10        # users per processing chunk
 
 # noGesture: fallback crop length if no gesture segments are available
-NO_GESTURE_CROP_FALLBACK = int(1.3 * FS)  # 260 samples
+NO_GESTURE_CROP_FALLBACK = int(1.0 * FS)  # 260 samples
 
 # Outlier-detection thresholds
 IQR_VOTE_PCT  = 0.25      # >25 % of features out-of-bounds -> BAD
