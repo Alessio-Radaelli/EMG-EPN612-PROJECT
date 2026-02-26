@@ -96,8 +96,8 @@ def get_model_config(no_gpu=False):
         "max_depth":       sp_randint(3, 10),
         "learning_rate":   loguniform(0.01, 0.3),
         "min_child_weight": sp_randint(1, 15),
-        "subsample":       uniform(0.6, 0.4),       # [0.5, 1.0]
-        "colsample_bytree": uniform(0.6, 0.4),      # [0.5, 1.0]
+        "subsample":       uniform(0.6, 0.4),       # [0.6, 1.0]
+        "colsample_bytree": uniform(0.6, 0.4),      # [0.6, 1.0]
         "reg_alpha":       loguniform(1e-3, 10),
         "reg_lambda":      loguniform(1e-3, 10),
         "gamma":           uniform(0, 5),
